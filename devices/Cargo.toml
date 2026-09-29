@@ -1,0 +1,9 @@
+[package]
+name = "devices"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(dev_only)', 'cfg(dev_only, values("timers", "ide", "chipset", "vga"))'] }
