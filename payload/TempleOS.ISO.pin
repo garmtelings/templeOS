@@ -1,0 +1,10 @@
+# Pin for the TempleOS image embedded in TempleOS.exe.
+# Source of truth: templeos.org/Downloads/TempleOS.ISO, the last V5.03 build.
+# MD5 and size are the values independently published by the tinkeros
+# project (github.com/tinkeros/TempleOS README), which verified them against
+# the templeos.org download. SHA-256 is filled in by tools/fetch-payload.sh
+# the first time the file is fetched and matches both of these.
+name=TempleOS.ISO
+size=17350656
+md5=2facf5d7cfa08de4c47aede4a64cfb44
+sha256=

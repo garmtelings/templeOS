@@ -52,19 +52,22 @@ path.
 
 ### Hardware TempleOS needs (the entire device model)
 
-To be confirmed against the V5.03 kernel source (`/Kernel/*.HC`) in Phase 0:
+Confirmed against the V5.03 kernel source in Phase 0; the full spec, with
+source references, is [`docs/hw-surface.md`](docs/hw-surface.md). The
+machine is modelled on QEMU's i440FX + PIIX3 (`-machine pc`), which the
+reference traces use too:
 
 | Device | Why TempleOS needs it | Notes |
 |---|---|---|
 | BIOS (SeaBIOS) | Boot sector, `INT 13h` to load the kernel, `INT 15h E820`, `INT 10h` mode 0x12 | Run the real BIOS; don't fake the calls |
 | VGA (planar 640×480×16) | All graphics via 0xA0000 + seq/GC/CRTC/DAC ports | Most performance-critical device |
 | 8259 PIC + 8254 PIT | Timer IRQ, PC speaker tone (PIT ch2 + port 0x61) | |
-| Local APIC + I/O APIC | Multicore (INIT-SIPI to start APs), IPIs | Use WHPX xAPIC emulation mode |
+| Local APIC (+ idle I/O APIC) | Multicore (broadcast INIT-SIPI to start APs), tick and wake IPIs | Use WHPX xAPIC emulation mode. The kernel never touches the I/O APIC (one demo does) |
 | CMOS/RTC (0x70/0x71) | Date/time | |
 | PS/2 controller (0x60/0x64) | Keyboard + mouse | |
-| PCI config (0xCF8/0xCFC) | Finding the IDE controller | Tiny PCI bus: host bridge + PIIX IDE |
-| ATA + ATAPI (legacy IDE ports) | CD boot (ATAPI) + install/use HDD (ATA PIO) | |
-| HPET (0xFED00000) | Timing, if the kernel uses it | Verify in Phase 0 |
+| PCI config (0xCF8/0xCFC) | Finding the IDE controller | Tiny PCI bus: host bridge + PIIX3 IDE. TempleOS reaches it only through SeaBIOS's 32-bit PCI BIOS, dropping out of long mode for every call |
+| ATA + ATAPI (legacy IDE ports) | CD boot (ATAPI) + install/use HDD | PIO with polling only: no DMA, no bus master |
+| HPET (0xFED00000) | Main clock (`tS`, `Busy`, TSC calibration) | Always probed. Only GCAP_ID, GEN_CONF and MAIN_CNT are used |
 | Serial 16550 (0x3F8) | Optional: debug log out of the guest | |
 
 Anything else the guest touches gets logged loudly as "unhandled port/MMIO"
@@ -73,7 +76,8 @@ during development. Nothing gets silently ignored.
 ### VGA performance
 
 TempleOS writes planar VGA memory with map-mask plane selection, so every
-write to 0xA0000 would cause a VM exit (millions per second). The fix below
+write to 0xA0000 would cause a VM exit: up to ~19k 64-bit stores per frame at
+29.97 frames/s, each split into 8 byte writes. The fix below
 doesn't change any guest-visible behavior:
 
 - Watch the sequencer map-mask and graphics-controller mode registers
@@ -110,14 +114,20 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
 ## Phases
 
 ### Phase 0 — Groundwork (spec before code)
-- Pin the artifacts: TempleOS V5.03 ISO (SHA-256), SeaBIOS and SeaVGABIOS
-  versions.
-- Audit the TempleOS kernel source for every `InU8/OutU8/…` port, MMIO
-  address, `CPUID` leaf and MSR it touches, and produce `docs/hw-surface.md`.
-  This list is the device model's spec.
-- Record reference traces: boot the ISO in QEMU (`-d int,cpu_reset`, a
-  port-I/O trace via a small QEMU plugin) to capture the exact order of
-  device interactions.
+- [x] Pin SeaBIOS / SeaVGABIOS: `payload/bios.bin`, `payload/vgabios.bin`
+  (SeaBIOS 1.16.3, hashes in `payload/SHA256SUMS`).
+- [~] Pin the TempleOS V5.03 ISO: size and MD5 are pinned in
+  `payload/TempleOS.ISO.pin`; `tools/fetch-payload.sh` downloads it, verifies
+  it and records the SHA-256. **Still to do:** run it from a machine that can
+  reach templeos.org or archive.org (the cloud build environment can't),
+  then commit the recorded hash.
+- [x] Audit the kernel source for every port, MMIO address, `CPUID` leaf,
+  MSR and BIOS call: [`docs/hw-surface.md`](docs/hw-surface.md).
+- [~] Reference traces: `tools/qemu-ref/qemu_trace.py` boots the machine in
+  QEMU with instruction counting and records port I/O, MMIO, PCI config and
+  IRQs plus screenshots; `summarize.py` turns a trace into the surface
+  tables. Tested on a BIOS-only boot. **Still to do:** record the TempleOS
+  boot traces once the ISO is available.
 
 ### Phase 1 — VMM skeleton
 - Create the WHPX partition, 1 vCPU and 512 MiB of guest RAM (TempleOS
@@ -204,7 +214,7 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
 /vmm        Rust crate: partition, vCPU loop, memory
 /devices    Rust crate: pic, pit, rtc, ps2, vga, ide, pci, apic glue, hpet
 /frontend   Rust crate: window, input, audio
-/payload    pinned ISO + BIOS blobs (Git LFS) + SHA256SUMS
+/payload    BIOS blobs + SHA256SUMS, ISO pin (ISO itself fetched, not committed)
 /tools      QEMU trace plugin, differential test harness
 /docs       hw-surface.md, test reports
 ```

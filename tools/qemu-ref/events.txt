@@ -1,0 +1,14 @@
+# QEMU trace events captured for the reference traces.
+# Port I/O as seen by the CPU (every IN/OUT, including those done by SeaBIOS).
+cpu_in
+cpu_out
+# MMIO to device regions (VGA window, LAPIC, IOAPIC, HPET, ...). RAM accesses
+# are not traced by QEMU, so this is exactly the device-visible MMIO surface.
+memory_region_ops_read
+memory_region_ops_write
+# PCI configuration space, whichever path (0xCF8/0xCFC or BIOS32) reached it.
+pci_cfg_read
+pci_cfg_write
+# Interrupt delivery, to reconstruct IRQ ordering.
+pic_interrupt
+apic_deliver_irq
