@@ -116,29 +116,66 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
 ### Phase 0 — Groundwork (spec before code)
 - [x] Pin SeaBIOS / SeaVGABIOS: `payload/bios.bin`, `payload/vgabios.bin`
   (SeaBIOS 1.16.3, hashes in `payload/SHA256SUMS`).
-- [~] Pin the TempleOS V5.03 ISO: size and MD5 are pinned in
-  `payload/TempleOS.ISO.pin`; `tools/fetch-payload.sh` downloads it, verifies
-  it and records the SHA-256. **Still to do:** run it from a machine that can
-  reach templeos.org or archive.org (the cloud build environment can't),
-  then commit the recorded hash.
+- [x] Pin the TempleOS V5.03 ISO: size, MD5 and SHA-256 are pinned in
+  `payload/TempleOS.ISO.pin` (`tools/fetch-payload.sh` downloads and
+  verifies it; the ISO itself is not committed).
 - [x] Audit the kernel source for every port, MMIO address, `CPUID` leaf,
   MSR and BIOS call: [`docs/hw-surface.md`](docs/hw-surface.md).
-- [~] Reference traces: `tools/qemu-ref/qemu_trace.py` boots the machine in
+- [x] Reference traces: `tools/qemu-ref/qemu_trace.py` boots the machine in
   QEMU with instruction counting and records port I/O, MMIO, PCI config and
   IRQs plus screenshots; `summarize.py` turns a trace into the surface
-  tables. Tested on a BIOS-only boot. **Still to do:** record the TempleOS
-  boot traces once the ISO is available.
+  tables. Recorded (in `ref/`, not committed; QEMU 8.2.2 from Ubuntu 24.04
+  in Docker): the BIOS alone, and the TempleOS boot through SeaBIOS POST,
+  the kernel's switch to long mode, `TimersInit`, the PCI scan and the start
+  of the ATA probe. The reference machine runs with `smm=off`, as QEMU does
+  on WHPX, which has no SMM.
+  - Under `-icount`, each probe of an empty IDE unit takes ~10 minutes of
+    wall time (the kernel's timeout is in guest time and TCG is slow), so
+    deterministic traces stop in the ATA probe. `--no-icount` runs get
+    further (CD found over ATAPI, `DskChg(':')`) but are not repeatable.
+  - `tools/qemu-ref/cpuid_ref.sh` captures the `qemu64` CPUID leaves the
+    guest sees (`docs/ref/cpuid-qemu64.txt`); the VMM presents exactly these.
+  - `tools/qemu-ref/fixtures.py` extracts test fixtures from a trace: PCI
+    config space at reset, the VGA EDID, the CD's IDENTIFY data
+    (`docs/ref/`).
 
-### Phase 1 — VMM skeleton
+### Phase 1 — VMM skeleton ✅
 - Create the WHPX partition, 1 vCPU and 512 MiB of guest RAM (TempleOS
-  minimum; default 2 GiB).
+  minimum; default 1 GiB, as in the reference traces).
 - Load SeaBIOS at 0xF0000/0xFFFF0000 and run it until it prints to the debug
-  port (0x402). **Milestone: BIOS banner in the log.**
+  port (0x402). **Milestone: BIOS banner in the log.** Reached ~1 ms after
+  power-on (`templeos --until bios-banner`).
+- Done in `vmm/`: `whpx.rs` (partition, mappings, registers; register
+  arrays must be 16-byte aligned), `memory.rs`, `cpuid.rs` (the captured
+  `qemu64` leaves via CPUID exits), `machine.rs` (run loop; I/O and MMIO go
+  through the WHPX instruction emulator, as in QEMU's WHPX backend; 8259
+  interrupts are injected as ExtINT events on interrupt-window exits, with
+  the local APIC emulated by the hypervisor in xAPIC mode; a kicker thread
+  cancels the vCPU at the next timer deadline).
 
-### Phase 2 — Boot to kernel
+### Phase 2 — Boot to kernel ✅
 - PIC, PIT, CMOS, PCI host bridge + PIIX IDE, ATAPI serving the embedded ISO.
 - **Milestone: the TempleOS boot loader loads `Kernel.BIN.C` and switches to
-  long mode** (checked by watching CR0/CR4/EFER on exits).
+  long mode** (checked by watching CR0/CR4/EFER on exits). Reached ~0.1 s
+  after power-on; the kernel's `TimersInit` follows at ~0.2 s
+  (`templeos --until long-mode` / `--until kernel-timers`). Within 3 s the
+  kernel has probed IDE, found the CD over ATAPI and copied it in.
+- Device models in `devices/` (plain Rust, unit tested, most replayed
+  against the reference trace with zero mismatches): PIC + ELCR, PIT +
+  port 0x61, RTC/CMOS, PCI (i440FX, PIIX3 ISA/IDE, PIIX4 PM, std VGA),
+  PIIX4 PM timer + APM, HPET, fw_cfg (with DMA), IDE/ATAPI, VGA register
+  file + Bochs VBE + BAR 2 EDID + ROM BAR, i8042 keyboard/mouse, i8257 DMA.
+  `devices/src/pc.rs` is the board (port and MMIO maps, IRQ wiring).
+- `--debugcon FILE` and `--trace FILE` (QEMU trace format, readable by
+  `tools/qemu-ref/summarize.py`) make runs comparable with the reference.
+- Known differences from the reference, all invisible to TempleOS, to
+  settle in Phase 6:
+  - fw_cfg has no ACPI/SMBIOS tables and no `kvmvapic` option ROM, so
+    SeaBIOS builds its own tables and keeps its PM base at 0xB000 (QEMU's
+    table loader moves it to 0x600).
+  - 0xC0000-0xFFFFF is always RAM (no PAM read-only enforcement).
+  - 0xA0000-0xBFFFF is plain RAM until Phase 3's VGA memory model.
+  - IDE commands complete instantly, so the guest never sees BSY.
 
 ### Phase 3 — Pixels
 - VGA: full register file, planar memory, DAC, and the fast-path remap above.

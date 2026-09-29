@@ -4,7 +4,8 @@
 The trace is the ground truth our own VMM is compared against (see PLAN.md,
 Phase 6). The machine configuration here is the one the VMM reproduces:
 
-  * i440FX + PIIX3 ("-machine pc"), HPET on, 1 CPU by default
+  * i440FX + PIIX3 ("-machine pc"), HPET on, SMM off (WHPX has no SMM,
+    and QEMU turns it off too when it runs on WHPX), 1 CPU by default
   * the pinned SeaBIOS / SeaVGABIOS from payload/
   * the ISO on the secondary IDE master (same slot as QEMU's -cdrom)
   * instruction counting (-icount) and a fixed RTC base, so runs are
@@ -105,7 +106,7 @@ def main():
     vgabios = os.path.join(PAYLOAD, "vgabios.bin")
     cmd = [
         args.qemu,
-        "-machine", "pc,hpet=on",
+        "-machine", "pc,hpet=on,smm=off",
         "-cpu", "qemu64",
         "-m", args.mem,
         "-smp", str(args.smp),

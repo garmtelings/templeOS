@@ -1,0 +1,5 @@
+# Scripts and configs are read by Linux tools (bash, QEMU, Python in containers);
+# keep LF even on Windows checkouts with core.autocrlf=true.
+* text=auto eol=lf
+*.bin binary
+*.ISO binary

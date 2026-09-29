@@ -310,6 +310,29 @@ ACPI, and no power-off: TempleOS has no shutdown; the user closes the window.
 RAM size: the plan defaults to 1 GiB (the reference traces use the same), and
 the minimum is 512 MiB.
 
+## 9a. What SeaBIOS's POST needs on top
+
+Measured from the reference traces (`ref/bios-only`, `ref/boot`). TempleOS
+never touches these, but the firmware does, so the VMM models them:
+
+| Device | Accesses | Model |
+|---|---|---|
+| QEMU fw_cfg (0x510 selector, 0x511 data, 0x514 DMA) | signature, file directory, `etc/e820`, CPU count, ACPI/SMBIOS tables | `devices/src/fwcfg.rs`; the VMM provides the e820 map and CPU counts. ACPI and SMBIOS tables are not provided yet, so SeaBIOS builds its own (Phase 6: replay QEMU's blobs for exact POST parity) |
+| PIIX4 PM (00:01.3) | PM base 0x600, PM timer at 0x608 (SeaBIOS's delay clock: "Using pmtimer, ioport 0x608"), 0x628 | `devices/src/acpi.rs` |
+| APM 0xB2/0xB3 | ACPI enable, SMM handshake (skipped with `smm=off`: config 0x5B = 0x02 marks SMM as initialized) | `devices/src/acpi.rs` |
+| i8257 DMA | 0x0D, 0xD4, 0xD6, 0xDA (master clear, cascade) | `devices/src/dma.rs`, no transfers |
+| ELCR 0x4D0/0x4D1 | written 0x00/0x0C | part of the PIC |
+| PCI | full bus scan, BAR sizing and assignment, PAM shadowing | `devices/src/pci.rs`; five functions (host bridge, PIIX3 ISA, PIIX3 IDE, PIIX4 PM, std VGA) |
+| std VGA BAR 2 | 256-byte EDID read | `devices/src/vga.rs` |
+| std VGA ROM BAR | SeaBIOS copies SeaVGABIOS to 0xC0000 from here | `devices/src/vga.rs` |
+| Bochs VBE DISPI (0x1CE/0x1CF) | SeaVGABIOS detects the VBE interface | `devices/src/vga.rs` |
+| Local APIC | SeaBIOS's CPU count probe (INIT/SIPI) | the hypervisor's xAPIC |
+| i8042 | keyboard/mouse init | `devices/src/ps2.rs` |
+
+The VMM also reports QEMU's `qemu64` CPUID leaves exactly
+(`docs/ref/cpuid-qemu64.txt`), including the AMD vendor string: SeaBIOS
+decides its physical address width and the e820 layout from them.
+
 ## 10. Outside the kernel
 
 - **Demos and optional utilities** may touch hardware directly. Known ones:
@@ -330,8 +353,16 @@ These need a real boot of the pinned ISO to settle (see
 `tools/qemu-ref/`):
 
 1. ~~Does SeaVGABIOS return `004Fh` for `4F02h`/`0x12`?~~ Yes (§1).
-2. Get the exact set and order of port accesses between `KStart16` and
-   `TimersInit`, for the differential tests.
+2. ~~Get the exact set and order of port accesses between `KStart16` and
+   `TimersInit`.~~ Recorded in `ref/boot/trace.log`. From the VBE mode set
+   to the first PIT write of `TimersInit` the guest touches only: VBE DISPI
+   (the mode set itself), the VGA registers and DAC (SeaVGABIOS finishing
+   mode 12h, then the kernel), ~105k byte writes to 0xA0000 (the kernel
+   draws its boot text straight into planar VGA memory), port 0x92, port
+   0x61, the RTC (date read), one PIT latch and read, and the local APIC
+   (SVR, ID, LDR, DFR). No PCI and no HPET access before `TimersInit`.
 3. Measure the VGA write rate per frame, to size the fast-path benefit.
+   (Needs a trace that reaches the desktop; QEMU's software CPU hadn't got
+   there after 15 minutes.)
 4. Check whether anything in the default boot (Adam start-up scripts,
    `HomeSys.HC`) touches hardware beyond this list.
