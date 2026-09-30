@@ -260,7 +260,7 @@ impl Keyboard {
 
 /// Set 2 bytes of one key event converted to set 1 (the same mapping the
 /// controller's translation applies).
-fn set2_to_set1(set2: &[u8]) -> Vec<u8> {
+pub(crate) fn set2_to_set1(set2: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(set2.len());
     let mut release = false;
     for &b in set2 {

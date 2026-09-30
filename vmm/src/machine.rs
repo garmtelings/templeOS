@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use devices::input::InputQueue;
 use devices::pc::{Pc, PcConfig};
 use devices::vga_render::{Frame, Renderer};
 use devices::Nanos;
@@ -44,6 +45,9 @@ pub struct Config {
 
 /// Receives each rendered frame (see [`Machine::set_display`]).
 pub type DisplayFn = Box<dyn FnMut(&Frame)>;
+
+/// Told the PC speaker's tone whenever it changes (None = silent).
+pub type SpeakerFn = Box<dyn FnMut(Option<f64>)>;
 
 /// Wall time between rendered frames.
 const FRAME_NS: Nanos = 1_000_000_000 / 60;
@@ -128,6 +132,9 @@ pub struct Machine {
     next_frame: Nanos,
     display: Option<DisplayFn>,
     stop_flag: Option<Arc<AtomicBool>>,
+    input: Option<Arc<InputQueue>>,
+    speaker: Option<SpeakerFn>,
+    speaker_hz: Option<f64>,
 }
 
 const VP: u32 = 0;
@@ -176,6 +183,9 @@ impl Machine {
             next_frame: 0,
             display: None,
             stop_flag: None,
+            input: None,
+            speaker: None,
+            speaker_hz: None,
         };
         m.reset_vcpu()?;
         Ok(m)
@@ -206,6 +216,17 @@ impl Machine {
     /// [`Machine::run`] returns [`Stop::Quit`] soon after `flag` becomes true.
     pub fn set_stop_flag(&mut self, flag: Arc<AtomicBool>) {
         self.stop_flag = Some(flag);
+    }
+
+    /// Keyboard and mouse events from `queue` are delivered to the guest
+    /// between vCPU runs.
+    pub fn set_input(&mut self, queue: Arc<InputQueue>) {
+        self.input = Some(queue);
+    }
+
+    /// Call `f` whenever the PC speaker starts, stops or changes pitch.
+    pub fn set_speaker(&mut self, f: SpeakerFn) {
+        self.speaker = Some(f);
     }
 
     /// Render the display as it is now.
@@ -270,6 +291,11 @@ impl Machine {
             }
             let now = self.now();
             self.pc.poll(now);
+            if let Some(q) = &self.input {
+                for ev in q.take() {
+                    self.pc.input(ev);
+                }
+            }
             if let Some(stop) = self.check_events(until) {
                 return Ok(stop);
             }
@@ -339,6 +365,13 @@ impl Machine {
     }
 
     fn check_events(&mut self, until: Option<Milestone>) -> Option<Stop> {
+        let hz = self.pc.speaker_hz();
+        if hz != self.speaker_hz {
+            self.speaker_hz = hz;
+            if let Some(f) = &mut self.speaker {
+                f(hz);
+            }
+        }
         let out = self.pc.take_debugcon();
         if !out.is_empty() {
             self.debugcon(&out);

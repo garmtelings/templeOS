@@ -2,32 +2,48 @@
 //!
 //! - Windowed: the picture at the largest whole-number scale that fits the
 //!   client area (sharp pixels), centered on black. Below 1x it shrinks to fit.
-//! - Fullscreen (Alt+Enter toggles): borderless on the current monitor, as
-//!   large as fits with the shape a real monitor gives it: 4:3 for VGA text
-//!   and graphics modes (a 720x400 text screen filled a 4:3 CRT too), square
-//!   pixels for VBE modes.
+//! - Fullscreen (host key + F or Enter toggles): borderless on the current
+//!   monitor, as large as fits with the shape a real monitor gives it (see
+//!   [`Frame::fit`]).
+//!
+//! Input, as in VirtualBox: the keyboard goes to TempleOS whenever the
+//! window has focus (read with Raw Input, so Alt, F10 and Pause arrive as
+//! real key events and the window menu never opens). Clicking the picture
+//! captures the mouse (hidden and confined to the window); the host key,
+//! Right Ctrl, releases it. The host key itself and host key combinations
+//! never reach the guest. Keys still held when the window loses focus are
+//! released in the guest, so nothing sticks.
 //!
 //! The VM thread never touches the window: it stores each frame in [`Shared`]
-//! and posts a message; painting happens here, on the UI thread.
+//! and posts a message; painting happens here, on the UI thread. Input goes
+//! the other way through [`Shared::input`].
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use devices::input::{InputEvent, InputQueue};
+use devices::keymap::{HostKey, KeyMapper};
 use devices::vga_render::Frame;
-use windows::core::{w, HSTRING};
+use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect,
-    MonitorFromWindow, SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    BLACK_BRUSH, COLORONCOLOR, DIB_RGB_COLORS, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    PAINTSTRUCT, SRCCOPY,
+    BeginPaint, ClientToScreen, EndPaint, FillRect, GetMonitorInfoW, GetStockObject,
+    InvalidateRect, MonitorFromWindow, SetStretchBltMode, StretchDIBits, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, BLACK_BRUSH, COLORONCOLOR, DIB_RGB_COLORS, HBRUSH, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
+    RAWINPUTDEVICE, RAWINPUTDEVICE_FLAGS, RAWINPUTHEADER, RAWMOUSE, RID_INPUT, RIM_TYPEKEYBOARD,
+    RIM_TYPEMOUSE,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// Posted by the VM thread when a new frame is in [`Shared::frame`].
@@ -45,6 +61,8 @@ pub struct Shared {
     /// Why the VM stopped, shown to the user if it was an error.
     exit_error: Mutex<Option<String>>,
     hwnd: Mutex<Option<usize>>,
+    /// Keyboard and mouse events for the guest.
+    pub input: Arc<InputQueue>,
 }
 
 impl Shared {
@@ -55,6 +73,7 @@ impl Shared {
             stop: Arc::new(AtomicBool::new(false)),
             exit_error: Mutex::new(None),
             hwnd: Mutex::new(None),
+            input: Arc::new(InputQueue::new()),
         })
     }
 
@@ -86,6 +105,22 @@ struct UiState {
     /// Pixels of the frame being shown (copied out of Shared on WM_APP_FRAME).
     frame: Frame,
     fullscreen: Option<WINDOWPLACEMENT>,
+    keymap: KeyMapper,
+    /// Keys the guest has seen pressed and not released.
+    pressed: HashSet<HostKey>,
+    /// Keys used in a host key combination: their release is swallowed too.
+    host_consumed: HashSet<HostKey>,
+    /// The host key is down; `host_used` if another key was pressed with it.
+    host_down: bool,
+    host_used: bool,
+    /// The mouse is captured: hidden, confined, and its motion goes to the guest.
+    captured: bool,
+    /// Mouse buttons the guest has seen held (PS/2 bit order).
+    buttons: u8,
+    /// Wheel movement not yet a whole notch (high-resolution wheels).
+    wheel_rest: i32,
+    /// Last absolute position (remote desktop sessions report absolute).
+    last_abs: Option<(i32, i32)>,
 }
 
 thread_local! {
@@ -123,12 +158,25 @@ pub fn run(shared: Arc<Shared>, fullscreen: bool, start: impl FnOnce()) -> Resul
         let _ = AdjustWindowRect(&mut rect, style, false);
 
         UI.with(|ui| {
-            *ui.borrow_mut() = Some(UiState { shared: shared.clone(), frame: Frame::default(), fullscreen: None });
+            *ui.borrow_mut() = Some(UiState {
+                shared: shared.clone(),
+                frame: Frame::default(),
+                fullscreen: None,
+                keymap: KeyMapper::new(),
+                pressed: HashSet::new(),
+                host_consumed: HashSet::new(),
+                host_down: false,
+                host_used: false,
+                captured: false,
+                buttons: 0,
+                wheel_rest: 0,
+                last_abs: None,
+            });
         });
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class,
-            w!("TempleOS"),
+            TITLE_FREE,
             style | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -141,6 +189,15 @@ pub fn run(shared: Arc<Shared>, fullscreen: bool, start: impl FnOnce()) -> Resul
         )
         .map_err(|e| e.to_string())?;
         *shared.hwnd.lock().unwrap() = Some(hwnd.0 as usize);
+        // Keyboard (usage 6) and mouse (usage 2) raw input while focused.
+        let devices = [2u16, 6].map(|usage| RAWINPUTDEVICE {
+            usUsagePage: 1,
+            usUsage: usage,
+            dwFlags: RAWINPUTDEVICE_FLAGS(0),
+            hwndTarget: hwnd,
+        });
+        RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+            .map_err(|e| format!("RegisterRawInputDevices: {e}"))?;
         if fullscreen {
             toggle_fullscreen(hwnd);
         }
@@ -183,12 +240,33 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_SYSKEYDOWN if wparam.0 as u16 == VK_RETURN.0 && lparam.0 & (1 << 29) != 0 => {
-                toggle_fullscreen(hwnd);
+            WM_INPUT => {
+                raw_input(hwnd, HRAWINPUT(lparam.0 as _));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            // Keys arrive through WM_INPUT. Swallowing the legacy messages
+            // keeps Alt/F10 from opening the window menu and stops beeps.
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP | WM_CHAR | WM_SYSCHAR | WM_DEADCHAR
+            | WM_SYSDEADCHAR => LRESULT(0),
+            WM_LBUTTONDOWN => {
+                capture(hwnd, true);
                 LRESULT(0)
             }
-            // Alt+Enter would otherwise beep.
-            WM_SYSCHAR if wparam.0 == '\r' as usize => LRESULT(0),
+            WM_SETCURSOR if captured() && (lparam.0 & 0xffff) as u32 == HTCLIENT => {
+                SetCursor(None);
+                LRESULT(1)
+            }
+            WM_SIZE | WM_MOVE => {
+                if captured() {
+                    clip_to_client(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_KILLFOCUS => {
+                capture(hwnd, false);
+                release_all_keys();
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 UI.with(|ui| {
                     if let Some(ui) = ui.borrow().as_ref() {
@@ -199,6 +277,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = ClipCursor(None);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -303,7 +382,209 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
             }
         });
     }
+    if captured() {
+        clip_to_client(hwnd);
+    }
     let _ = InvalidateRect(hwnd, None, false);
+}
+
+const TITLE_FREE: PCWSTR = w!("TempleOS - click to capture the mouse");
+const TITLE_CAPTURED: PCWSTR = w!("TempleOS - Right Ctrl releases the mouse");
+
+fn captured() -> bool {
+    UI.with(|ui| ui.borrow().as_ref().is_some_and(|ui| ui.captured))
+}
+
+/// Capture or release the mouse. Releasing lets go of any buttons the guest
+/// thinks are held.
+unsafe fn capture(hwnd: HWND, on: bool) {
+    let changed = UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        let Some(ui) = ui.as_mut() else { return false };
+        if ui.captured == on {
+            return false;
+        }
+        ui.captured = on;
+        ui.last_abs = None;
+        if !on && ui.buttons != 0 {
+            ui.buttons = 0;
+            ui.shared.input.push(InputEvent::Mouse { dx: 0, dy: 0, dz: 0, buttons: 0 });
+        }
+        true
+    });
+    if !changed {
+        return;
+    }
+    if on {
+        clip_to_client(hwnd);
+        SetCursor(None);
+        let _ = SetWindowTextW(hwnd, TITLE_CAPTURED);
+    } else {
+        let _ = ClipCursor(None);
+        if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+            SetCursor(arrow);
+        }
+        let _ = SetWindowTextW(hwnd, TITLE_FREE);
+    }
+}
+
+unsafe fn clip_to_client(hwnd: HWND) {
+    let mut r = RECT::default();
+    let _ = GetClientRect(hwnd, &mut r);
+    let mut tl = POINT { x: r.left, y: r.top };
+    let mut br = POINT { x: r.right, y: r.bottom };
+    let _ = ClientToScreen(hwnd, &mut tl);
+    let _ = ClientToScreen(hwnd, &mut br);
+    let _ = ClipCursor(Some(&RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y }));
+}
+
+/// Send a release for every key the guest has seen pressed.
+fn release_all_keys() {
+    UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        let Some(ui) = ui.as_mut() else { return };
+        let keys: Vec<HostKey> = ui.pressed.drain().collect();
+        for k in keys {
+            let bytes = ui.keymap.translate(k.code, k.e0, false, false);
+            if !bytes.is_empty() {
+                ui.shared.input.push(InputEvent::Key(bytes));
+            }
+        }
+        ui.host_down = false;
+        ui.host_consumed.clear();
+    });
+}
+
+/// What the host key combinations do.
+enum HostAction {
+    None,
+    ReleaseMouse,
+    ToggleFullscreen,
+}
+
+unsafe fn raw_input(hwnd: HWND, handle: HRAWINPUT) {
+    let mut raw = RAWINPUT::default();
+    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
+    let n = GetRawInputData(
+        handle,
+        RID_INPUT,
+        Some(&mut raw as *mut RAWINPUT as _),
+        &mut size,
+        std::mem::size_of::<RAWINPUTHEADER>() as u32,
+    );
+    if n == u32::MAX || n == 0 {
+        return;
+    }
+    let action = UI.with(|ui| {
+        let mut ui = ui.borrow_mut();
+        let Some(ui) = ui.as_mut() else { return HostAction::None };
+        if raw.header.dwType == RIM_TYPEKEYBOARD.0 {
+            let k = raw.data.keyboard;
+            // 0xFF: keyboard overrun; 0: keys without a scan code (media keys).
+            if k.MakeCode == 0 || k.MakeCode > 0x7f {
+                return HostAction::None;
+            }
+            let pressed = k.Flags & RI_KEY_BREAK as u16 == 0;
+            let e0 = k.Flags & RI_KEY_E0 as u16 != 0;
+            let e1 = k.Flags & RI_KEY_E1 as u16 != 0;
+            key_event(ui, HostKey { code: k.MakeCode as u8, e0 }, e1, pressed)
+        } else if raw.header.dwType == RIM_TYPEMOUSE.0 {
+            if ui.captured {
+                mouse_event(ui, &raw.data.mouse);
+            }
+            HostAction::None
+        } else {
+            HostAction::None
+        }
+    });
+    match action {
+        HostAction::None => {}
+        HostAction::ReleaseMouse => capture(hwnd, false),
+        HostAction::ToggleFullscreen => toggle_fullscreen(hwnd),
+    }
+}
+
+fn key_event(ui: &mut UiState, key: HostKey, e1: bool, pressed: bool) -> HostAction {
+    if key == HostKey::RIGHT_CTRL && !e1 {
+        if pressed {
+            if !ui.host_down {
+                ui.host_down = true;
+                ui.host_used = false;
+            }
+            return HostAction::None;
+        }
+        ui.host_down = false;
+        return if ui.host_used { HostAction::None } else { HostAction::ReleaseMouse };
+    }
+    if ui.host_down && pressed {
+        ui.host_used = true;
+        ui.host_consumed.insert(key);
+        return match (key.code, key.e0) {
+            (0x21, false) | (0x1c, _) => HostAction::ToggleFullscreen, // F, Enter
+            _ => HostAction::None,
+        };
+    }
+    if !pressed && ui.host_consumed.remove(&key) {
+        return HostAction::None;
+    }
+    let bytes = ui.keymap.translate(key.code, key.e0, e1, pressed);
+    if !e1 {
+        if pressed {
+            ui.pressed.insert(key);
+        } else {
+            ui.pressed.remove(&key);
+        }
+    }
+    if !bytes.is_empty() {
+        ui.shared.input.push(InputEvent::Key(bytes));
+    }
+    HostAction::None
+}
+
+fn mouse_event(ui: &mut UiState, m: &RAWMOUSE) {
+    let (mut dx, mut dy) = (m.lLastX, m.lLastY);
+    if m.usFlags.0 & MOUSE_MOVE_ABSOLUTE.0 != 0 {
+        // Absolute 0..65535 over the (virtual) screen: turn into deltas.
+        // SAFETY: plain metric queries.
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) };
+        let (x, y) = (m.lLastX * w / 65536, m.lLastY * h / 65536);
+        (dx, dy) = match ui.last_abs.replace((x, y)) {
+            Some((px, py)) => (x - px, y - py),
+            None => (0, 0),
+        };
+    }
+    // SAFETY: the button fields of the RAWMOUSE union.
+    let (flags, data) = unsafe { (m.Anonymous.Anonymous.usButtonFlags, m.Anonymous.Anonymous.usButtonData) };
+    let flags = u32::from(flags);
+    let mut buttons = ui.buttons;
+    for (bit, down, up) in [
+        (0, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP),
+        (1, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP),
+        (2, RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP),
+        (3, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP),
+        (4, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP),
+    ] {
+        if flags & down != 0 {
+            buttons |= 1 << bit;
+        }
+        if flags & up != 0 {
+            buttons &= !(1 << bit);
+        }
+    }
+    let mut dz = 0;
+    if flags & RI_MOUSE_WHEEL != 0 {
+        // Windows: positive = away from the user, 120 per notch.
+        // PS/2: positive = towards the user.
+        ui.wheel_rest -= i32::from(data as i16);
+        dz = ui.wheel_rest / 120;
+        ui.wheel_rest %= 120;
+    }
+    if dx == 0 && dy == 0 && dz == 0 && buttons == ui.buttons {
+        return;
+    }
+    ui.buttons = buttons;
+    // PS/2 Y grows upwards; the screen's grows downwards.
+    ui.shared.input.push(InputEvent::Mouse { dx, dy: -dy, dz, buttons });
 }
 
 /// Show an error before any window exists (e.g. WHPX missing when started

@@ -5,6 +5,7 @@
 //! without one: the machine reports boot milestones and the SeaBIOS debug
 //! console, and can stop at a milestone.
 
+mod audio;
 mod window;
 
 use std::fs::File;
@@ -23,7 +24,10 @@ const USAGE: &str = "\
 usage: templeos [options]
 
   --headless          run without a window
-  --fullscreen        start fullscreen (Alt+Enter toggles)
+  --fullscreen        start fullscreen
+
+In the window: click to capture the mouse, Right Ctrl releases it,
+Right Ctrl+F toggles fullscreen. All other keys go to TempleOS.
   --mem MIB           guest RAM in MiB (default 1024, minimum 512)
   --until MILESTONE   stop at bios-banner, long-mode or kernel-timers
   --seconds N         stop after N seconds of wall time
@@ -196,14 +200,17 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
 fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     hide_console_if_ours();
     let shared = window::Shared::new();
+    let speaker = audio::Speaker::new();
+    let audio_thread = audio::start(speaker.clone());
     let vm_shared = shared.clone();
+    let vm_speaker = speaker.clone();
     let mut vm_thread = None;
     let started = window::run(shared.clone(), args.fullscreen, || {
         vm_thread = Some(
             std::thread::Builder::new()
                 .name("vcpu".into())
                 .spawn(move || {
-                    let error = vm_thread_main(&args, &vm_shared).err().map(|e| e.to_string());
+                    let error = vm_thread_main(&args, &vm_shared, &vm_speaker).err().map(|e| e.to_string());
                     vm_shared.vm_exited(error);
                 })
                 .expect("spawn VM thread"),
@@ -213,23 +220,33 @@ fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(t) = vm_thread {
         let _ = t.join();
     }
+    speaker.stop();
+    let _ = audio_thread.join();
     started.map_err(|e| {
         window::error_box(&e);
         e.into()
     })
 }
 
-fn vm_thread_main(args: &Args, shared: &Arc<window::Shared>) -> Result<(), Box<dyn std::error::Error>> {
+fn vm_thread_main(
+    args: &Args,
+    shared: &Arc<window::Shared>,
+    speaker: &Arc<audio::Speaker>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let limit = args.seconds.map(Duration::from_secs_f64);
     loop {
         let mut m = machine(args)?;
         let s = shared.clone();
         m.set_display(Box::new(move |frame| s.present(frame)));
         m.set_stop_flag(shared.stop.clone());
+        m.set_input(shared.input.clone());
+        let sp = speaker.clone();
+        m.set_speaker(Box::new(move |hz| sp.set(hz)));
         let stop = m.run(args.until, limit)?;
         if let Some(path) = &args.screenshot {
             std::fs::write(path, m.render().to_ppm())?;
         }
+        speaker.set(None);
         match stop {
             Stop::ResetRequested => println!("[vmm] guest reset: rebooting"),
             _ => return Ok(()),

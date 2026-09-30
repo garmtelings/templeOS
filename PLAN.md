@@ -211,7 +211,7 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   plane mapping; frames at 60 Hz; HLT is a halted state (stays halted with
   IF=0), so the display keeps updating while the guest idles.
 - [x] Win32 window (`src/window.rs`): whole-number scaling in a window,
-  borderless fullscreen with Alt+Enter (4:3 for VGA modes, square pixels for
+  borderless fullscreen (Right Ctrl+F since Phase 4; 4:3 for VGA modes, square pixels for
   VBE), per-monitor DPI aware. The VM runs on its own thread; a guest reboot
   restarts the machine; closing the window stops it. Started by double-click,
   the console window closes itself. `--headless` keeps the Phase 1-2 CLI.
@@ -220,12 +220,33 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   if anything looks wrong.
 
 ### Phase 4 — Input and sound
-- PS/2 keyboard (scan code set 1, which is what TempleOS reads) and PS/2
-  mouse. Raw-input capture, with a host-key escape (Right Ctrl) like other
-  VMs.
-- PC speaker: turn PIT ch2 frequency + port 0x61 gate into a square wave on
-  WASAPI.
-- **Milestone: interactive shell, hymns play.**
+- [x] Keyboard: the window reads keys with Raw Input (set 1 make codes plus
+  E0/E1 flags, so Alt, F10, Pause and Print Screen arrive as real key
+  events) and `devices::keymap` turns them into the set 2 bytes a PS/2
+  keyboard sends. TempleOS selects set 2 and keeps the controller's
+  translation on, so it reads set 1. Every key round-trips through the
+  8042 translation table exactly (tested); Print Screen and Pause produce
+  QEMU's sequences. Host keyboard repeat is passed through, as QEMU does.
+- [x] Mouse: click to capture (hidden, confined to the window), raw relative
+  motion, five buttons and the wheel as PS/2 packets. TempleOS's IntelliMouse
+  detection finds a wheel mouse and gets 4-byte packets (tested end to end
+  by replaying its `KbdInit`/`MsHardRst` port sequence on the board model).
+- [x] Host key Right Ctrl, as in VirtualBox: alone it releases the mouse;
+  Right Ctrl+F or +Enter toggles fullscreen. Neither reaches the guest. Keys
+  held when the window loses focus are released in the guest.
+- [x] Input crosses from the UI thread to the VM thread through
+  `devices::input::InputQueue` (mouse motion merged, button changes kept in
+  order) and is delivered between vCPU runs.
+- [x] PC speaker: the VM reports each tone change (PIT channel 2 in mode 3,
+  gated on, speaker data on) with its time; a WASAPI thread plays a square
+  wave and applies each change exactly 60 ms after it happened, so note
+  lengths are as the guest timed them. Tested with TempleOS's `Snd()` port
+  sequence. No audio device: silent, with a note on stderr.
+- Not done: the Windows key still opens the Start menu (would need a
+  low-level keyboard hook); a host key other than Right Ctrl isn't
+  configurable.
+- **Milestone: interactive shell, hymns play.** Not yet confirmed: needs a
+  run on Windows with the ISO.
 
 ### Phase 5 — Multicore, timing and disk
 - More vCPUs (TempleOS uses all cores; default = host cores, capped at 8),

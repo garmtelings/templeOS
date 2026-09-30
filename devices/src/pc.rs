@@ -9,6 +9,7 @@ use crate::dma::Dma;
 use crate::fwcfg::FwCfg;
 use crate::hpet::{Hpet, HPET_BASE};
 use crate::ide::{IdeChannel, Media};
+use crate::input::InputEvent;
 use crate::pci::PciBus;
 use crate::pic::Pic;
 use crate::pit::Pit;
@@ -473,6 +474,21 @@ impl Pc {
     pub fn ps2_mut(&mut self) -> &mut Ps2 {
         &mut self.ps2
     }
+
+    /// Deliver a host input event to the keyboard or mouse and update the
+    /// interrupt lines.
+    pub fn input(&mut self, ev: InputEvent) {
+        match ev {
+            InputEvent::Key(set2) => self.ps2.keyboard_input(&set2),
+            InputEvent::Mouse { dx, dy, dz, buttons } => self.ps2.mouse_input(dx, dy, dz, buttons),
+        }
+        self.sync_irqs();
+    }
+
+    /// The tone the PC speaker is producing, if any.
+    pub fn speaker_hz(&self) -> Option<f64> {
+        self.pit.speaker_hz()
+    }
 }
 
 enum Mmio {
@@ -544,4 +560,159 @@ fn fw_cfg(ram_size: u64) -> FwCfg {
     }
     f.add_file("etc/e820", e820);
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoMemory;
+    impl GuestMemory for NoMemory {
+        fn read(&self, _: u64, _: &mut [u8]) -> bool {
+            false
+        }
+        fn write(&mut self, _: u64, _: &[u8]) -> bool {
+            false
+        }
+    }
+
+    fn pc() -> Pc {
+        static ROM: [u8; 3] = [0x55, 0xaa, 0x01];
+        Pc::new(PcConfig { ram_size: 512 << 20, vgabios: &ROM, cdrom: None, rtc_base: 0 })
+    }
+
+    fn out(pc: &mut Pc, port: u16, val: u8) {
+        pc.io_write(port, 1, val.into(), 0, &mut NoMemory);
+    }
+
+    fn inb(pc: &mut Pc, port: u16) -> u8 {
+        pc.io_read(port, 1, 0) as u8
+    }
+
+    /// KbdCmdRead: wait for output-buffer-full, read the byte.
+    fn read_data(pc: &mut Pc) -> u8 {
+        assert!(inb(pc, 0x64) & 1 != 0, "no data waiting");
+        inb(pc, 0x60)
+    }
+
+    /// KbdMsCmdAck: D4, byte, expect ACK.
+    fn mouse_cmd(pc: &mut Pc, val: u8) {
+        out(pc, 0x64, 0xd4);
+        out(pc, 0x60, val);
+        assert_eq!(read_data(pc), 0xfa, "mouse ACK for {val:#x}");
+    }
+
+    /// The i8042, keyboard, mouse and PIC as SeaBIOS and then TempleOS's
+    /// KbdInit / MsHardRst / IntInit1 leave them.
+    fn templeos_input_setup(pc: &mut Pc) {
+        // SeaBIOS: command byte = translate, system flag, kbd IRQ, aux off.
+        out(pc, 0x64, 0x60);
+        out(pc, 0x60, 0x65);
+        // IntInit1 (KInts.HC): vectors 0x20/0x28, buffered 8086 mode.
+        for (port, val) in [(0x20, 0x11), (0xa0, 0x11), (0x21, 0x20), (0xa1, 0x28), (0x21, 0x04), (0xa1, 0x02), (0x21, 0x0d), (0xa1, 0x09), (0x21, 0xfa), (0xa1, 0xff)] {
+            out(pc, port, val);
+        }
+        // KbdInit: A7, AE, F0 02 (scan code set 2), unmask IRQ1.
+        out(pc, 0x64, 0xa7);
+        out(pc, 0x64, 0xae);
+        out(pc, 0x60, 0xf0);
+        assert_eq!(read_data(pc), 0xfa);
+        out(pc, 0x60, 0x02);
+        assert_eq!(read_data(pc), 0xfa);
+        let m = inb(pc, 0x21);
+        out(pc, 0x21, m & !2);
+        // MsHardRst: AD, A8, reset, IntelliMouse knock, ID, setup, enable.
+        out(pc, 0x64, 0xad);
+        out(pc, 0x64, 0xa8);
+        mouse_cmd(pc, 0xff);
+        assert_eq!(read_data(pc), 0xaa);
+        assert_eq!(read_data(pc), 0x00);
+        for v in [0xf3, 200, 0xf3, 100, 0xf3, 80] {
+            mouse_cmd(pc, v);
+        }
+        mouse_cmd(pc, 0xf2);
+        assert_eq!(read_data(pc), 3, "wheel mouse");
+        mouse_cmd(pc, 0xf3);
+        mouse_cmd(pc, 10);
+        mouse_cmd(pc, 0xf2);
+        assert_eq!(read_data(pc), 3);
+        for v in [0xe8, 0x03, 0xe6, 0xf3, 100, 0xf4] {
+            mouse_cmd(pc, v);
+        }
+        out(pc, 0x64, 0x20);
+        let b = read_data(pc);
+        out(pc, 0x64, 0x60);
+        out(pc, 0x60, (b | 2) & !0x20);
+        out(pc, 0x64, 0xae);
+        // Unmask IRQ12 (MsHardInit) and IRQ2 is already open.
+        let m = inb(pc, 0xa1);
+        out(pc, 0xa1, m & !0x10);
+        // The polled replies above also raised IRQ1/IRQ12 edges, latched in
+        // the PIC; the CPU takes them once interrupts are on (the handlers
+        // find nothing new to read). Do the same.
+        while pc.has_interrupt() {
+            let v = pc.acknowledge_interrupt();
+            assert!(v == 0x21 || v == 0x2c, "vector {v:#x}");
+            out(pc, 0xa0, 0x20);
+            out(pc, 0x20, 0x20);
+        }
+        assert_eq!(inb(pc, 0x64) & 1, 0, "nothing left to read");
+    }
+
+    #[test]
+    fn host_key_reaches_templeos_as_set1_on_irq1() {
+        let mut pc = pc();
+        templeos_input_setup(&mut pc);
+        let mut km = crate::keymap::KeyMapper::new();
+        pc.input(InputEvent::Key(km.translate(0x1e, false, false, true))); // A down
+        assert!(pc.has_interrupt());
+        assert_eq!(pc.acknowledge_interrupt(), 0x21);
+        assert_eq!(inb(&mut pc, 0x64) & 0x21, 0x01, "keyboard byte, not AUX");
+        assert_eq!(inb(&mut pc, 0x60), 0x1e);
+        out(&mut pc, 0x20, 0x20);
+        // An extended key: two bytes, two interrupts.
+        pc.input(InputEvent::Key(km.translate(0x48, true, false, false))); // Up released
+        let mut got = Vec::new();
+        while pc.has_interrupt() {
+            assert_eq!(pc.acknowledge_interrupt(), 0x21);
+            got.push(inb(&mut pc, 0x60));
+            out(&mut pc, 0x20, 0x20);
+        }
+        assert_eq!(got, [0xe0, 0xc8]);
+    }
+
+    #[test]
+    fn templeos_snd_drives_the_speaker() {
+        let mut pc = pc();
+        assert_eq!(pc.speaker_hz(), None);
+        // KMisc.HC Snd(ona): period = ClampI64(SYS_TIMER_FREQ/Ona2Freq(ona), 1, U16_MAX).
+        let period: u16 = 2712; // ~440 Hz
+        out(&mut pc, 0x43, 0xb6);
+        out(&mut pc, 0x42, period as u8);
+        out(&mut pc, 0x42, (period >> 8) as u8);
+        let v = inb(&mut pc, 0x61);
+        out(&mut pc, 0x61, 3 | v);
+        let hz = pc.speaker_hz().expect("tone");
+        assert!((hz - 1_193_182.0 / 2712.0).abs() < 0.01, "{hz}");
+        let v = inb(&mut pc, 0x61);
+        out(&mut pc, 0x61, v & !3);
+        assert_eq!(pc.speaker_hz(), None);
+    }
+
+    #[test]
+    fn host_mouse_reaches_templeos_as_4_byte_packets_on_irq12() {
+        let mut pc = pc();
+        templeos_input_setup(&mut pc);
+        pc.input(InputEvent::Mouse { dx: 5, dy: -3, dz: 1, buttons: 1 });
+        let mut pkt = Vec::new();
+        while pc.has_interrupt() {
+            assert_eq!(pc.acknowledge_interrupt(), 0x2c);
+            assert_eq!(inb(&mut pc, 0x64) & 0x21, 0x21, "AUX byte");
+            pkt.push(inb(&mut pc, 0x60));
+            out(&mut pc, 0xa0, 0x20);
+            out(&mut pc, 0x20, 0x20);
+        }
+        // Left button, Y negative; dx 5, dy -3, wheel +1.
+        assert_eq!(pkt, [0x29, 0x05, 0xfd, 0x01]);
+    }
 }
