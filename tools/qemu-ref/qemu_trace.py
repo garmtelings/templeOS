@@ -41,12 +41,16 @@ def sha256(path):
 
 
 class QMP:
-    def __init__(self, path, timeout):
+    """QMP client. `addr` is a Unix socket path, or a (host, port) pair
+    (Windows, where Python has no Unix sockets)."""
+
+    def __init__(self, addr, timeout):
         deadline = time.monotonic() + timeout
+        family = socket.AF_INET if isinstance(addr, tuple) else socket.AF_UNIX
         while True:
             try:
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(path)
+                self.sock = socket.socket(family, socket.SOCK_STREAM)
+                self.sock.connect(addr)
                 break
             except OSError:
                 if time.monotonic() > deadline:
@@ -102,9 +106,16 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    qmp_path = os.path.join(args.out, "qmp.sock")
-    if os.path.exists(qmp_path):
-        os.unlink(qmp_path)
+    if hasattr(socket, "AF_UNIX"):
+        qmp_addr = os.path.join(args.out, "qmp.sock")
+        if os.path.exists(qmp_addr):
+            os.unlink(qmp_addr)
+        qmp_arg = f"unix:{qmp_addr},server=on,wait=off"
+    else:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            qmp_addr = ("127.0.0.1", s.getsockname()[1])
+        qmp_arg = f"tcp:127.0.0.1:{qmp_addr[1]},server=on,wait=off"
 
     bios = os.path.join(PAYLOAD, "bios.bin")
     vgabios = os.path.join(PAYLOAD, "vgabios.bin")
@@ -121,7 +132,7 @@ def main():
         "-display", "none",
         "-no-reboot",
         "-nodefaults",
-        "-qmp", f"unix:{qmp_path},server=on,wait=off",
+        "-qmp", qmp_arg,
         "-chardev", f"file,id=dbg,path={os.path.join(args.out, 'debugcon.log')}",
         "-device", "isa-debugcon,iobase=0x402,chardev=dbg",
         "-trace", f"events={os.path.join(HERE, 'events.txt')},"
@@ -149,7 +160,7 @@ def main():
     proc = subprocess.Popen(cmd)
     shots = []
     try:
-        qmp = QMP(qmp_path, timeout=10)
+        qmp = QMP(qmp_addr, timeout=10)
         qmp.cmd("cont")
         start = time.monotonic()
         n = 0

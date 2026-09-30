@@ -321,7 +321,8 @@ Done and passing here (no ISO or Windows needed):
 - [x] **Payload integrity**: build.rs pins, and the exe re-checks the
   SHA-256 of its embedded BIOS, VGA BIOS and ISO at every start.
 
-Ready, needs a Windows machine with the ISO:
+Ready, needs a Windows machine with the ISO. `tools/phase6-windows.ps1`
+runs the first two in one go and writes `phase6-results/summary.txt`:
 - [ ] **Scripted differential runs**: `templeos.exe --script S --shots A`
   and `tools/qemu-ref/qemu_trace.py --script S --wait-scale 10 --out B`
   run the same input script (`devices/src/script.rs`; type/key/mouse/
