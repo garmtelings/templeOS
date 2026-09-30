@@ -17,6 +17,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use vmm::{Config, Machine, Milestone, Stop};
 
 static BIOS: &[u8] = include_bytes!("../payload/bios.bin");
+/// SHA-256 of each embedded file as pinned in payload/ (see build.rs).
+static PINS: [(&str, &[u8], &str); 3] = [
+    ("SeaBIOS", BIOS, env!("PAYLOAD_SHA256_BIOS")),
+    ("SeaVGABIOS", VGABIOS, env!("PAYLOAD_SHA256_VGABIOS")),
+    ("TempleOS.ISO", ISO, env!("PAYLOAD_SHA256_TEMPLEOS")),
+];
 static VGABIOS: &[u8] = include_bytes!("../payload/vgabios.bin");
 static ISO: &[u8] = include_bytes!("../payload/TempleOS.ISO");
 
@@ -173,6 +179,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(e) = verify_payload() {
+        if args.headless {
+            eprintln!("templeos: {e}");
+        } else {
+            window::error_box(&e);
+        }
+        return ExitCode::FAILURE;
+    }
     let result = if args.headless { run_headless(&args) } else { run_windowed(args) };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -181,6 +195,22 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Check the embedded BIOS, VGA BIOS and ISO against the hashes pinned at
+/// build time, so a damaged or modified exe never boots something other
+/// than the official image.
+fn verify_payload() -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    for (name, data, want) in PINS {
+        let got: String = Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect();
+        if got != want {
+            return Err(format!(
+                "this TempleOS.exe is damaged: its embedded {name} has SHA-256 {got}, not the pinned {want}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {

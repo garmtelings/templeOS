@@ -13,6 +13,7 @@ edition.workspace = true
 description = "TempleOS V5.03 in a single Windows executable"
 
 [dependencies]
+sha2 = "0.11.0"
 vmm = { path = "vmm" }
 devices = { path = "devices" }
 windows = { version = "0.58", features = [
