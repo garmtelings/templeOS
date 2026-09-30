@@ -35,6 +35,8 @@ pub struct Config {
     pub bios: &'static [u8],
     pub vgabios: &'static [u8],
     pub cdrom: Option<&'static [u8]>,
+    /// Hard disk on the primary IDE master.
+    pub hdd: Option<Box<dyn devices::ide::DiskImage>>,
     /// Guest wall-clock time at power-on, in Unix seconds.
     pub rtc_base: i64,
     /// Map a VGA plane straight into the guest while that is exact
@@ -157,6 +159,7 @@ impl Machine {
             ram_size: cfg.ram_size,
             vgabios: cfg.vgabios,
             cdrom: cfg.cdrom,
+            hdd: cfg.hdd,
             rtc_base: cfg.rtc_base,
         });
         let start = Instant::now();

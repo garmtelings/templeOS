@@ -34,6 +34,10 @@ fullscreen. All other keys go to TempleOS.
   --seconds N         stop after N seconds of wall time
   --iso PATH          boot this ISO instead of the embedded one
   --no-cd             boot with no CD in the drive
+  --hdd PATH          hard disk image (raw; created, 2 GiB, if missing).
+                      Default with a window: TempleOS.hdd next to the exe
+                      (or in %LOCALAPPDATA%\\TempleOS); headless: none
+  --no-hdd            no hard disk
   --rtc-base UNIX     guest clock at power-on, Unix seconds (default: now)
   --exact-vga         emulate every VGA memory access (no plane mapping)
   --screenshot FILE   save the display as a PPM when stopping
@@ -45,6 +49,8 @@ fullscreen. All other keys go to TempleOS.
 ";
 
 struct Args {
+    hdd: Option<String>,
+    no_hdd: bool,
     headless: bool,
     fullscreen: bool,
     exact_vga: bool,
@@ -63,6 +69,8 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
+        hdd: None,
+        no_hdd: false,
         headless: false,
         fullscreen: false,
         exact_vga: false,
@@ -83,6 +91,8 @@ fn parse_args() -> Result<Args, String> {
         let mut value = || it.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
             "--headless" => a.headless = true,
+            "--hdd" => a.hdd = Some(value()?),
+            "--no-hdd" => a.no_hdd = true,
             "--fullscreen" => a.fullscreen = true,
             "--exact-vga" => a.exact_vga = true,
             "--screenshot" => a.screenshot = Some(value()?),
@@ -177,11 +187,20 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
     let rtc_base = args.rtc_base.unwrap_or_else(|| {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
     });
+    let hdd = match hdd_path(args) {
+        Some(path) => {
+            let disk = devices::ide::FileDisk::open(&path, HDD_SIZE)
+                .map_err(|e| format!("hard disk {}: {e}", path.display()))?;
+            Some(Box::new(disk) as Box<dyn devices::ide::DiskImage>)
+        }
+        None => None,
+    };
     let mut m = Machine::new(Config {
         ram_size: args.mem_mib << 20,
         bios: BIOS,
         vgabios: VGABIOS,
         cdrom,
+        hdd,
         rtc_base,
         vga_fast_path: !args.exact_vga,
     })?;
@@ -194,6 +213,34 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
         m.set_trace(Box::new(BufWriter::new(File::create(path)?)));
     }
     Ok(m)
+}
+
+/// Size of a newly created hard disk image.
+const HDD_SIZE: u64 = 2 << 30;
+
+/// Which hard disk image to use: --hdd, else (with a window) TempleOS.hdd
+/// next to the exe, or under %LOCALAPPDATA%\TempleOS when the exe's folder
+/// isn't writable.
+fn hdd_path(args: &Args) -> Option<std::path::PathBuf> {
+    if args.no_hdd {
+        return None;
+    }
+    if let Some(p) = &args.hdd {
+        return Some(p.into());
+    }
+    if args.headless {
+        return None;
+    }
+    let beside_exe = std::env::current_exe().ok()?.with_file_name("TempleOS.hdd");
+    let writable = |p: &std::path::Path| {
+        p.exists() || std::fs::OpenOptions::new().write(true).create_new(true).open(p).map(|_| std::fs::remove_file(p)).is_ok()
+    };
+    if writable(&beside_exe) {
+        return Some(beside_exe);
+    }
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("TempleOS");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("TempleOS.hdd"))
 }
 
 /// The normal way to run: a window, with the VM on its own thread. A guest

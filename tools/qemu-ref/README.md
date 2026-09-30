@@ -40,3 +40,20 @@ TEMPLEOS_TRACE=ref/vga-gfx/trace.log cargo test -p devices replay_vga -- --ignor
 Every read is compared with QEMU's value, and the final frame must equal
 QEMU's last screendump pixel for pixel. Without `TEMPLEOS_TRACE` the test
 uses `ref/boot/trace.log`.
+
+## Hard disk reference run
+
+`tools/qemu-ref/disk_ref.py` (needs nasm) boots a disk holding
+`ata_probe.asm`, which drives the primary IDE master the way SeaBIOS and
+TempleOS do: IDENTIFY, READ NATIVE MAX (EXT) with HOB reads, SET MAX, READ
+and WRITE MULTIPLE EXT one sector per DRQ, LBA28, CHS after INITIALIZE
+DEVICE PARAMETERS, error paths and SRST. Check the IDE model against it:
+
+```sh
+TEMPLEOS_TRACE=ref/disk/trace.log TEMPLEOS_CD=none \
+TEMPLEOS_HDD=ref/disk/initial.img TEMPLEOS_HDD_FINAL=ref/disk/disk.img \
+    cargo test -p devices replay_reference_trace -- --ignored
+```
+
+Every register read must match, and the model's disk must end up
+byte-identical to the image QEMU wrote.

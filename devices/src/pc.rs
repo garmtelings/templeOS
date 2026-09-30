@@ -8,7 +8,7 @@ use crate::acpi::Piix4Pm;
 use crate::dma::Dma;
 use crate::fwcfg::FwCfg;
 use crate::hpet::{Hpet, HPET_BASE};
-use crate::ide::{IdeChannel, Media};
+use crate::ide::{DiskImage, IdeChannel, Media};
 use crate::input::InputEvent;
 use crate::pci::PciBus;
 use crate::pic::Pic;
@@ -24,6 +24,8 @@ pub struct PcConfig {
     pub vgabios: &'static [u8],
     /// CD image on the secondary IDE master (QEMU `-cdrom`).
     pub cdrom: Option<&'static [u8]>,
+    /// Hard disk on the primary IDE master (QEMU `-hda`).
+    pub hdd: Option<Box<dyn DiskImage>>,
     /// Guest wall-clock time at power-on, in Unix seconds.
     pub rtc_base: i64,
 }
@@ -74,7 +76,7 @@ impl Pc {
             fwcfg: fw_cfg(cfg.ram_size),
             vga,
             ide: [
-                IdeChannel::new_on_channel(0, None, None),
+                IdeChannel::new_on_channel(0, cfg.hdd.map(Media::Disk), None),
                 IdeChannel::new(cfg.cdrom.map(Media::Cdrom), None),
             ],
             port92: 0,
@@ -87,8 +89,12 @@ impl Pc {
         pc
     }
 
-    /// CMOS configuration bytes as QEMU's pc_cmos_init writes them for this
-    /// machine: no floppy or hard disk, boot from CD, one CPU.
+    /// CMOS configuration bytes as QEMU's pc_cmos_init and
+    /// pc_cmos_init_late write them for this machine: no floppy, one CPU.
+    /// Without a hard disk it boots from the CD (the reference machine's
+    /// `-boot d`); with one it uses QEMU's default order, hard disk first
+    /// and CD last, so an installed TempleOS boots from the disk and a blank
+    /// disk falls through to the CD.
     fn init_cmos(&mut self, ram_size: u64) {
         let kib = ram_size / 1024;
         let ext_kib = (kib.saturating_sub(1024)).min(0xFFFF) as u16;
@@ -109,6 +115,30 @@ impl Pc {
         ];
         for (index, val) in bytes {
             self.rtc.set_nvram(index, val);
+        }
+        if let Some(g) = self.ide[0].disk_geometry(0) {
+            // cmos_init_hd: drive type 47 (user defined) and its geometry.
+            let c = g.cylinders;
+            for (index, val) in [
+                (0x12, 0xf0),
+                (0x19, 47),
+                (0x1b, c as u8),
+                (0x1c, (c >> 8) as u8),
+                (0x1d, g.heads as u8),
+                (0x1e, 0xff),
+                (0x1f, 0xff),
+                (0x20, 0xc0 | (u8::from(g.heads > 8) << 3)),
+                (0x21, c as u8),
+                (0x22, (c >> 8) as u8),
+                (0x23, g.sectors as u8),
+                // Translation hints, 2 bits per drive: QEMU's constant - 1.
+                (0x39, g.translation - 1),
+                // Boot order "cad": hard disk, floppy, CD.
+                (0x3d, 0x12),
+                (0x38, 0x30),
+            ] {
+                self.rtc.set_nvram(index, val);
+            }
         }
     }
 
@@ -578,7 +608,7 @@ mod tests {
 
     fn pc() -> Pc {
         static ROM: [u8; 3] = [0x55, 0xaa, 0x01];
-        Pc::new(PcConfig { ram_size: 512 << 20, vgabios: &ROM, cdrom: None, rtc_base: 0 })
+        Pc::new(PcConfig { ram_size: 512 << 20, vgabios: &ROM, cdrom: None, hdd: None, rtc_base: 0 })
     }
 
     fn out(pc: &mut Pc, port: u16, val: u8) {
@@ -679,6 +709,34 @@ mod tests {
             out(&mut pc, 0x20, 0x20);
         }
         assert_eq!(got, [0xe0, 0xc8]);
+    }
+
+    #[test]
+    fn hard_disk_cmos_matches_qemu() {
+        // The ref/disk run's disk: 32 MiB, one partition ending at head 15,
+        // sector 63. QEMU gave SeaBIOS PCHS 65/16/63 without translation.
+        let mut img = vec![0u8; 32 << 20];
+        img[0x1be..0x1ce].copy_from_slice(&[0x80, 1, 1, 0, 0x83, 15, 0xff, 0xff, 63, 0, 0, 0, 0xc1, 0xff, 0, 0]);
+        img[510] = 0x55;
+        img[511] = 0xaa;
+        static ROM: [u8; 3] = [0x55, 0xaa, 0x01];
+        let mut pc = Pc::new(PcConfig {
+            ram_size: 512 << 20,
+            vgabios: &ROM,
+            cdrom: None,
+            hdd: Some(Box::new(crate::ide::MemDisk(img))),
+            rtc_base: 0,
+        });
+        let mut cmos = |i: u8| {
+            out(&mut pc, 0x70, i);
+            inb(&mut pc, 0x71)
+        };
+        // Values the reference trace shows SeaBIOS reading.
+        assert_eq!([cmos(0x39), cmos(0x3d), cmos(0x38)], [0x00, 0x12, 0x30]);
+        assert_eq!(cmos(0x12), 0xf0);
+        assert_eq!(cmos(0x19), 47);
+        let geo: Vec<u8> = (0x1b..=0x23).map(&mut cmos).collect();
+        assert_eq!(geo, [65, 0, 16, 0xff, 0xff, 0xc8, 65, 0, 63]);
     }
 
     #[test]

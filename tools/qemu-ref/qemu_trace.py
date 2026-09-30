@@ -129,7 +129,10 @@ def main():
     iso = None if args.iso == "none" else args.iso
     if iso:
         cmd += ["-drive", f"file={iso},media=cdrom,if=ide,index=2,readonly=on"]
-        cmd += ["-boot", "d"]
+        # CD only: boot it. With a hard disk too, keep QEMU's default order
+        # (disk first), which is what templeos.exe does.
+        if not args.hdd:
+            cmd += ["-boot", "d"]
     if args.hdd:
         cmd += ["-drive", f"file={args.hdd},format=raw,if=ide,index=0"]
 

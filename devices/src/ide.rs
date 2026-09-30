@@ -4,7 +4,9 @@
 //!
 //! Each [`IdeChannel`] is one cable: a command block (0x1F0-0x1F7 or
 //! 0x170-0x177), a control block register (0x3F6 or 0x376) and two drive
-//! slots. The CD is served straight from a `&'static [u8]` ISO image.
+//! slots. The CD is served straight from a `&'static [u8]` ISO image; a hard
+//! disk from a [`DiskImage`] (a file, or memory in tests), written through
+//! on every WRITE command.
 //!
 //! Guest-visible behavior follows QEMU closely, including its quirks: every
 //! drive keeps QEMU's persistent I/O buffer, so replies that QEMU only
@@ -14,16 +16,88 @@
 //! model completes that work at once, so the guest never sees BSY.
 //! There is no DMA and no bus-master interface.
 
+use std::io;
+
 use crate::unhandled;
 
 /// What sits in a drive slot.
-///
-/// Phase 5 adds `Disk` (a writable hard disk image). The command dispatch
-/// already separates packet devices from ATA devices, so a disk is a new
-/// arm in [`Drive::ata_command`] plus its sector transfer states.
 pub enum Media {
     /// Read-only CD/DVD holding an ISO 9660 image (2048-byte blocks).
     Cdrom(&'static [u8]),
+    /// A hard disk (512-byte sectors).
+    Disk(Box<dyn DiskImage>),
+}
+
+/// Storage behind a hard disk: whole 512-byte sectors.
+pub trait DiskImage: Send {
+    /// Size in 512-byte sectors.
+    fn sectors(&self) -> u64;
+    /// Read `buf.len() / 512` sectors starting at `lba`.
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> io::Result<()>;
+    /// Write `buf.len() / 512` sectors starting at `lba`.
+    fn write(&mut self, lba: u64, buf: &[u8]) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+/// A disk image in memory (tests, or a throwaway disk).
+pub struct MemDisk(pub Vec<u8>);
+
+impl DiskImage for MemDisk {
+    fn sectors(&self) -> u64 {
+        self.0.len() as u64 / 512
+    }
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+        let at = lba as usize * 512;
+        buf.copy_from_slice(self.0.get(at..at + buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?);
+        Ok(())
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> io::Result<()> {
+        let at = lba as usize * 512;
+        self.0.get_mut(at..at + buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?.copy_from_slice(buf);
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A raw disk image file. Every write goes straight to the file; FLUSH
+/// CACHE also syncs it to stable storage.
+pub struct FileDisk {
+    file: std::fs::File,
+    sectors: u64,
+}
+
+impl FileDisk {
+    /// Open `path` read-write, creating it with `create_size` bytes (zero
+    /// filled, sparse where the file system allows) if it doesn't exist.
+    pub fn open(path: &std::path::Path, create_size: u64) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        if file.metadata()?.len() == 0 {
+            file.set_len(create_size)?;
+        }
+        let sectors = file.metadata()?.len() / 512;
+        Ok(FileDisk { file, sectors })
+    }
+}
+
+impl DiskImage for FileDisk {
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(lba * 512))?;
+        self.file.read_exact(buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        self.file.seek(SeekFrom::Start(lba * 512))?;
+        self.file.write_all(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.sync_data()
+    }
 }
 
 // Status register bits.
@@ -44,12 +118,13 @@ const CTRL_HOB: u8 = 0x80;
 
 // Device/head register bits.
 const DEV_HS: u8 = 0x0f;
+const DEV_LBA: u8 = 0x40;
 const DEV_SELECT: u8 = 0x10;
 const DEV_ALWAYS_ON: u8 = 0xa0;
 
 // ATAPI interrupt reason, reported in the sector count register.
-const INT_REASON_CD: u8 = 0x01;
-const INT_REASON_IO: u8 = 0x02;
+const INT_REASON_CD: u32 = 0x01;
+const INT_REASON_IO: u32 = 0x02;
 
 // SCSI sense keys.
 const NO_SENSE: u8 = 0x00;
@@ -84,6 +159,15 @@ const MMC_PROFILE_CD_ROM: u16 = 0x0008;
 /// QEMU_HW_VERSION, reported as firmware revision.
 const FIRMWARE_VERSION: &str = "2.5+";
 const CD_MODEL: &str = "QEMU DVD-ROM";
+const HD_MODEL: &str = "QEMU HARDDISK";
+/// QEMU's MAX_MULT_SECTORS: READ/WRITE MULTIPLE block size after reset.
+const MAX_MULT_SECTORS: u8 = 16;
+
+/// BIOS disk translation hints (QEMU `BIOS_ATA_TRANSLATION_*`), reported in
+/// CMOS register 0x39.
+pub const BIOS_ATA_TRANSLATION_NONE: u8 = 1;
+pub const BIOS_ATA_TRANSLATION_LBA: u8 = 2;
+pub const BIOS_ATA_TRANSLATION_LARGE: u8 = 3;
 
 /// What happens when the current PIO data transfer runs out (QEMU's
 /// `end_transfer_func`). The variant also fixes the transfer direction.
@@ -97,13 +181,81 @@ enum EndTransfer {
     AtapiPacket,
     /// Next ATAPI data-in chunk (`ide_atapi_cmd_reply_end`); device to host.
     AtapiReplyEnd,
+    /// Next block of a disk read (`ide_sector_read`); device to host.
+    SectorRead,
+    /// Block of a disk write is complete (`ide_sector_write`); host to device.
+    SectorWrite,
 }
 
 impl EndTransfer {
     /// QEMU's `ide_is_pio_out`: true when data flows to the host.
     fn is_data_in(self) -> bool {
-        self != EndTransfer::AtapiPacket
+        !matches!(self, EndTransfer::AtapiPacket | EndTransfer::SectorWrite)
     }
+}
+
+/// A hard disk's CHS geometry and BIOS translation, as QEMU's
+/// `hd_geometry_guess` picks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    pub cylinders: u32,
+    pub heads: u32,
+    pub sectors: u32,
+    pub translation: u8,
+}
+
+impl Geometry {
+    /// QEMU `hd_geometry_guess` for an image file: a logical geometry from
+    /// the MBR's partition table when there is one, else 16 heads and 63
+    /// sectors per track.
+    pub fn guess(disk: &mut dyn DiskImage) -> Geometry {
+        let nb = disk.sectors();
+        let for_size = || {
+            let cyls = (nb / (16 * 63)).clamp(2, 16383) as u32;
+            (cyls, 16, 63)
+        };
+        match guess_disk_lchs(disk) {
+            None => {
+                let (c, h, s) = for_size();
+                let t = if c <= 1024 && h <= 16 && s <= 63 { BIOS_ATA_TRANSLATION_NONE } else { BIOS_ATA_TRANSLATION_LBA };
+                Geometry { cylinders: c, heads: h, sectors: s, translation: t }
+            }
+            Some((_, heads, _)) if heads > 16 => {
+                let (c, h, s) = for_size();
+                let t = if c * h <= 131072 { BIOS_ATA_TRANSLATION_LARGE } else { BIOS_ATA_TRANSLATION_LBA };
+                Geometry { cylinders: c, heads: h, sectors: s, translation: t }
+            }
+            Some((c, h, s)) => Geometry { cylinders: c, heads: h, sectors: s, translation: BIOS_ATA_TRANSLATION_NONE },
+        }
+    }
+}
+
+/// QEMU `guess_disk_lchs`: heads and sectors from the first partition entry
+/// with a size and a non-zero end head.
+fn guess_disk_lchs(disk: &mut dyn DiskImage) -> Option<(u32, u32, u32)> {
+    let mut mbr = [0u8; 512];
+    disk.read(0, &mut mbr).ok()?;
+    if mbr[510] != 0x55 || mbr[511] != 0xaa {
+        return None;
+    }
+    for i in 0..4 {
+        let p = &mbr[0x1be + 16 * i..0x1be + 16 * (i + 1)];
+        let nr_sects = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+        let end_head = p[5];
+        if nr_sects != 0 && end_head != 0 {
+            let heads = u32::from(end_head) + 1;
+            let sectors = u32::from(p[6] & 63);
+            if sectors == 0 {
+                continue;
+            }
+            let cylinders = disk.sectors() / u64::from(heads * sectors);
+            if !(1..=16383).contains(&cylinders) {
+                continue;
+            }
+            return Some((cylinders as u32, heads, sectors));
+        }
+    }
+    None
 }
 
 /// State of the channel shared by both drives: the device control register
@@ -130,7 +282,10 @@ struct Drive {
 
     feature: u8,
     error: u8,
-    nsector: u8,
+    /// Sector count. Like QEMU's `int nsector`, it holds the full count
+    /// (up to 65536) once a command has combined it with the HOB byte;
+    /// the register reads its low byte.
+    nsector: u32,
     sector: u8,
     lcyl: u8,
     hcyl: u8,
@@ -161,6 +316,20 @@ struct Drive {
     cd_sector_size: usize,
     tray_open: bool,
     tray_locked: bool,
+
+    // Hard disk state.
+    lba48: bool,
+    /// Sectors per DRQ block of the current command.
+    req_nb_sectors: u32,
+    mult_sectors: u8,
+    /// Current (INITIALIZE DEVICE PARAMETERS) and native geometry.
+    cylinders: u32,
+    heads: u32,
+    sectors: u32,
+    drive_heads: u32,
+    drive_sectors: u32,
+    /// BIOS translation hint for CMOS 0x39.
+    translation: u8,
 }
 
 impl Drive {
@@ -196,9 +365,31 @@ impl Drive {
             cd_sector_size: 0,
             tray_open: false,
             tray_locked: false,
+            lba48: false,
+            req_nb_sectors: 0,
+            mult_sectors: 0,
+            cylinders: 0,
+            heads: 0,
+            sectors: 0,
+            drive_heads: 0,
+            drive_sectors: 0,
+            translation: 0,
         };
+        if let Some(Media::Disk(disk)) = &mut d.media {
+            let g = Geometry::guess(disk.as_mut());
+            d.cylinders = g.cylinders;
+            d.heads = g.heads;
+            d.sectors = g.sectors;
+            d.drive_heads = g.heads;
+            d.drive_sectors = g.sectors;
+            d.translation = g.translation;
+        }
         d.reset();
         d
+    }
+
+    fn is_disk(&self) -> bool {
+        matches!(self.media, Some(Media::Disk(_)))
     }
 
     fn present(&self) -> bool {
@@ -211,8 +402,9 @@ impl Drive {
 
     /// Medium size in 512-byte sectors (QEMU's `nb_sectors`).
     fn nb_sectors(&self) -> u64 {
-        match self.media {
+        match &self.media {
             Some(Media::Cdrom(img)) => img.len() as u64 / 512,
+            Some(Media::Disk(d)) => d.sectors(),
             None => 0,
         }
     }
@@ -248,6 +440,7 @@ impl Drive {
         self.elementary_transfer_size = 0;
         self.io_buffer_index = 0;
         self.cd_sector_size = 0;
+        self.mult_sectors = MAX_MULT_SECTORS;
         self.set_signature();
         self.end_transfer = EndTransfer::Dummy;
         self.data_ptr = 0;
@@ -263,6 +456,7 @@ impl Drive {
         self.sector = 1;
         let (lcyl, hcyl) = match self.media {
             Some(Media::Cdrom(_)) => (0x14, 0xeb),
+            Some(Media::Disk(_)) => (0, 0),
             None => (0xff, 0xff),
         };
         self.lcyl = lcyl;
@@ -304,6 +498,8 @@ impl Drive {
             EndTransfer::Dummy | EndTransfer::Stop => self.transfer_stop(),
             EndTransfer::AtapiPacket => self.atapi_command(bus),
             EndTransfer::AtapiReplyEnd => self.atapi_reply_end(bus),
+            EndTransfer::SectorRead => self.sector_read(bus),
+            EndTransfer::SectorWrite => self.sector_write(bus),
         }
     }
 
@@ -365,6 +561,16 @@ impl Drive {
 
         self.status = READY_STAT | BUSY_STAT;
         self.error = 0;
+        if self.is_disk() {
+            if self.disk_command(bus, cmd) {
+                self.status &= !BUSY_STAT;
+                if set_dsc && self.error == 0 {
+                    self.status |= SEEK_STAT;
+                }
+                bus.set_irq();
+            }
+            return;
+        }
         let complete = match cmd {
             0x08 => self.cmd_device_reset(),
             0x20 | 0xec => {
@@ -407,9 +613,260 @@ impl Drive {
         match (&self.media, cmd) {
             (Some(Media::Cdrom(_)), 0x08 | 0xa0 | 0xa1 | 0x20 | 0xe7 | 0xec) => Some(false),
             (Some(Media::Cdrom(_)), 0xef) => Some(true),
+            // QEMU's HD_OK entries without SET_DSC ...
+            (
+                Some(Media::Disk(_)),
+                0x20 | 0x21 | 0x24 | 0x29 | 0x30 | 0x31 | 0x34 | 0x39 | 0x3c | 0x94 | 0x95 | 0x96
+                | 0x97 | 0x99 | 0xc4 | 0xc5 | 0xe0 | 0xe1 | 0xe2 | 0xe3 | 0xe6 | 0xe7 | 0xea | 0xec,
+            ) => Some(false),
+            // ... and with it.
+            (
+                Some(Media::Disk(_)),
+                0x10 | 0x27 | 0x40 | 0x41 | 0x42 | 0x70 | 0x91 | 0x98 | 0xc6 | 0xe5 | 0xef | 0xf8,
+            ) => Some(true),
             (_, 0x90) => Some(false),
             _ => None,
         }
+    }
+
+    // ---- hard disk (QEMU hw/ide/core.c) -----------------------------------
+
+    /// Runs a command `ata_permitted` admitted for a disk. Returns true when
+    /// it completed (the caller raises the IRQ), false when it opened a data
+    /// transfer or raised the IRQ itself.
+    fn disk_command(&mut self, bus: &mut Bus, cmd: u8) -> bool {
+        match cmd {
+            0x20 | 0x21 | 0x24 => {
+                self.lba48_transform(cmd == 0x24);
+                self.req_nb_sectors = 1;
+                self.sector_read(bus);
+                false
+            }
+            0xc4 | 0x29 => {
+                if self.mult_sectors == 0 {
+                    self.abort_command();
+                    return true;
+                }
+                self.lba48_transform(cmd == 0x29);
+                self.req_nb_sectors = u32::from(self.mult_sectors);
+                self.sector_read(bus);
+                false
+            }
+            0x30 | 0x31 | 0x34 | 0x3c => {
+                self.lba48_transform(cmd == 0x34);
+                self.req_nb_sectors = 1;
+                self.status = SEEK_STAT | READY_STAT;
+                self.transfer_start(0, 512, EndTransfer::SectorWrite);
+                false
+            }
+            0xc5 | 0x39 => {
+                if self.mult_sectors == 0 {
+                    self.abort_command();
+                    return true;
+                }
+                self.lba48_transform(cmd == 0x39);
+                self.req_nb_sectors = u32::from(self.mult_sectors);
+                let n = self.nsector.min(self.req_nb_sectors) as usize;
+                self.status = SEEK_STAT | READY_STAT;
+                self.transfer_start(0, 512 * n, EndTransfer::SectorWrite);
+                false
+            }
+            0x40 | 0x41 | 0x42 => {
+                self.lba48_transform(cmd == 0x42);
+                true
+            }
+            0x27 | 0xf8 => {
+                if self.nb_sectors() == 0 {
+                    self.abort_command();
+                } else {
+                    let (h, s) = (self.heads, self.sectors);
+                    self.heads = self.drive_heads;
+                    self.sectors = self.drive_sectors;
+                    self.lba48_transform(cmd == 0x27);
+                    self.set_sector(self.nb_sectors() - 1);
+                    self.heads = h;
+                    self.sectors = s;
+                }
+                true
+            }
+            0x91 => {
+                // INITIALIZE DEVICE PARAMETERS.
+                self.heads = u32::from(self.select & DEV_HS) + 1;
+                self.sectors = self.nsector;
+                bus.set_irq();
+                true
+            }
+            0xc6 => {
+                let n = self.nsector & 0xff;
+                if n != 0 && (n > u32::from(MAX_MULT_SECTORS) || n & (n - 1) != 0) {
+                    self.abort_command();
+                } else {
+                    self.mult_sectors = n as u8;
+                }
+                true
+            }
+            0xe5 | 0x98 => {
+                self.nsector = 0xff; // active or idle
+                true
+            }
+            0xe7 | 0xea => {
+                if let Some(Media::Disk(d)) = &mut self.media {
+                    if d.flush().is_err() {
+                        self.rw_error(bus);
+                        return false;
+                    }
+                }
+                self.status = READY_STAT | SEEK_STAT;
+                true
+            }
+            0xec => {
+                if !self.identify_set {
+                    self.identify = hd_identify(self);
+                    self.identify_set = true;
+                }
+                for (i, w) in self.identify.iter().enumerate() {
+                    self.io_buffer[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+                }
+                self.status = READY_STAT | SEEK_STAT;
+                self.transfer_start(0, 512, EndTransfer::Stop);
+                bus.set_irq();
+                false
+            }
+            0xef => self.cmd_set_features(),
+            // RECALIBRATE, SEEK, standby/idle/sleep: nothing to do.
+            _ => true,
+        }
+    }
+
+    /// QEMU `ide_cmd_lba48_transform`: turn the count registers into the
+    /// full sector count (0 means 256, or 65536 in LBA48).
+    fn lba48_transform(&mut self, lba48: bool) {
+        self.lba48 = lba48;
+        if !lba48 {
+            if self.nsector == 0 {
+                self.nsector = 256;
+            }
+        } else if self.nsector == 0 && self.hob_nsector == 0 {
+            self.nsector = 65536;
+        } else {
+            self.nsector = (u32::from(self.hob_nsector) << 8) | (self.nsector & 0xff);
+        }
+    }
+
+    /// QEMU `ide_get_sector`: LBA48, LBA28 or CHS from the task file.
+    fn get_sector(&self) -> i64 {
+        if self.select & DEV_LBA != 0 {
+            if self.lba48 {
+                (i64::from(self.hob_hcyl) << 40)
+                    | (i64::from(self.hob_lcyl) << 32)
+                    | (i64::from(self.hob_sector) << 24)
+                    | (i64::from(self.hcyl) << 16)
+                    | (i64::from(self.lcyl) << 8)
+                    | i64::from(self.sector)
+            } else {
+                (i64::from(self.select & DEV_HS) << 24)
+                    | (i64::from(self.hcyl) << 16)
+                    | (i64::from(self.lcyl) << 8)
+                    | i64::from(self.sector)
+            }
+        } else {
+            let cyl = (i64::from(self.hcyl) << 8) | i64::from(self.lcyl);
+            cyl * i64::from(self.heads) * i64::from(self.sectors)
+                + i64::from(self.select & DEV_HS) * i64::from(self.sectors)
+                + (i64::from(self.sector) - 1)
+        }
+    }
+
+    /// QEMU `ide_set_sector`.
+    fn set_sector(&mut self, n: u64) {
+        if self.select & DEV_LBA != 0 {
+            if self.lba48 {
+                self.sector = n as u8;
+                self.lcyl = (n >> 8) as u8;
+                self.hcyl = (n >> 16) as u8;
+                self.hob_sector = (n >> 24) as u8;
+                self.hob_lcyl = (n >> 32) as u8;
+                self.hob_hcyl = (n >> 40) as u8;
+            } else {
+                self.select = (self.select & !DEV_HS) | ((n >> 24) as u8 & DEV_HS);
+                self.hcyl = (n >> 16) as u8;
+                self.lcyl = (n >> 8) as u8;
+                self.sector = n as u8;
+            }
+        } else {
+            let hs = u64::from(self.heads * self.sectors).max(1);
+            let cyl = n / hs;
+            let r = n % hs;
+            let secs = u64::from(self.sectors).max(1);
+            self.hcyl = (cyl >> 8) as u8;
+            self.lcyl = cyl as u8;
+            self.select = (self.select & !DEV_HS) | ((r / secs) as u8 & DEV_HS);
+            self.sector = (r % secs) as u8 + 1;
+        }
+    }
+
+    fn sect_range_ok(&self, sector: i64, n: u32) -> bool {
+        sector >= 0 && (sector as u64).saturating_add(u64::from(n)) <= self.nb_sectors()
+    }
+
+    /// QEMU `ide_rw_error`.
+    fn rw_error(&mut self, bus: &mut Bus) {
+        self.abort_command();
+        bus.set_irq();
+    }
+
+    /// QEMU `ide_sector_read` + `ide_sector_read_cb`, done at once: read the
+    /// next block of up to `req_nb_sectors` into the buffer and open it.
+    fn sector_read(&mut self, bus: &mut Bus) {
+        self.status = READY_STAT | SEEK_STAT;
+        self.error = 0;
+        let sector = self.get_sector();
+        let n = self.nsector.min(self.req_nb_sectors);
+        if self.nsector == 0 {
+            self.transfer_stop();
+            return;
+        }
+        if !self.sect_range_ok(sector, n) {
+            self.rw_error(bus);
+            return;
+        }
+        let len = n as usize * 512;
+        let Some(Media::Disk(d)) = &mut self.media else { unreachable!("sector_read on a non-disk") };
+        if d.read(sector as u64, &mut self.io_buffer[..len]).is_err() {
+            self.rw_error(bus);
+            return;
+        }
+        self.set_sector(sector as u64 + u64::from(n));
+        self.nsector -= n;
+        self.transfer_start(0, len, EndTransfer::SectorRead);
+        bus.set_irq();
+    }
+
+    /// QEMU `ide_sector_write` + `ide_sector_write_cb`: the host filled a
+    /// block; write it and open the next one.
+    fn sector_write(&mut self, bus: &mut Bus) {
+        self.status = READY_STAT | SEEK_STAT;
+        let sector = self.get_sector();
+        let n = self.nsector.min(self.req_nb_sectors);
+        if !self.sect_range_ok(sector, n) {
+            self.rw_error(bus);
+            return;
+        }
+        let len = n as usize * 512;
+        let Some(Media::Disk(d)) = &mut self.media else { unreachable!("sector_write on a non-disk") };
+        if d.write(sector as u64, &self.io_buffer[..len]).is_err() {
+            self.rw_error(bus);
+            return;
+        }
+        self.nsector -= n;
+        self.set_sector(sector as u64 + u64::from(n));
+        if self.nsector == 0 {
+            self.transfer_stop();
+        } else {
+            let n1 = self.nsector.min(self.req_nb_sectors) as usize;
+            self.transfer_start(0, 512 * n1, EndTransfer::SectorWrite);
+        }
+        bus.set_irq();
     }
 
     fn cmd_device_reset(&mut self) -> bool {
@@ -675,7 +1132,7 @@ impl Drive {
         let Some(lba) = self.lba else { return false };
         let img = match self.media {
             Some(Media::Cdrom(img)) => img,
-            None => return false,
+            _ => return false,
         };
         let raw = match self.cd_sector_size {
             2048 => false,
@@ -1112,6 +1569,71 @@ fn qemu_known_ata_command(cmd: u8) -> bool {
 }
 
 /// IDENTIFY PACKET DEVICE words, as QEMU's `ide_atapi_identify` builds them.
+/// QEMU `ide_identify` for a hard disk (write cache on, no WWN, 512-byte
+/// physical sectors, rotation rate unreported). Like QEMU 8.2's ide-hd it
+/// advertises TRIM (words 69 and 169); the DATA SET MANAGEMENT command
+/// itself isn't implemented (it aborts), and neither SeaBIOS nor TempleOS
+/// issues it.
+fn hd_identify(d: &Drive) -> [u16; 256] {
+    let mut w = [0u16; 256];
+    w[0] = 0x0040;
+    w[1] = d.cylinders as u16;
+    w[3] = d.heads as u16;
+    w[4] = (512 * d.sectors) as u16;
+    w[5] = 512;
+    w[6] = d.sectors as u16;
+    put_ata_string(&mut w[10..20], &d.serial);
+    w[20] = 3;
+    w[21] = 512;
+    w[22] = 4;
+    put_ata_string(&mut w[23..27], FIRMWARE_VERSION);
+    put_ata_string(&mut w[27..47], HD_MODEL);
+    w[47] = 0x8000 | u16::from(MAX_MULT_SECTORS);
+    w[48] = 1;
+    w[49] = (1 << 11) | (1 << 9) | (1 << 8);
+    w[51] = 0x200;
+    w[52] = 0x200;
+    w[53] = 1 | (1 << 1) | (1 << 2);
+    w[54] = d.cylinders as u16;
+    w[55] = d.heads as u16;
+    w[56] = d.sectors as u16;
+    let oldsize = d.cylinders * d.heads * d.sectors;
+    w[57] = oldsize as u16;
+    w[58] = (oldsize >> 16) as u16;
+    if d.mult_sectors != 0 {
+        w[59] = 0x100 | u16::from(d.mult_sectors);
+    }
+    let nb = d.nb_sectors();
+    let lba28 = nb.min((1 << 28) - 1);
+    w[60] = lba28 as u16;
+    w[61] = (lba28 >> 16) as u16;
+    w[62] = 0x07;
+    w[63] = 0x07;
+    w[64] = 0x03;
+    w[65] = 120;
+    w[66] = 120;
+    w[67] = 120;
+    w[68] = 120;
+    w[69] = 1 << 14; // determinate TRIM behavior
+    w[80] = 0xf0;
+    w[81] = 0x16;
+    w[82] = (1 << 14) | (1 << 5) | 1;
+    w[83] = (1 << 14) | (1 << 13) | (1 << 12) | (1 << 10);
+    w[84] = 1 << 14;
+    w[85] = (1 << 14) | (1 << 5) | 1;
+    w[86] = (1 << 13) | (1 << 12) | (1 << 10);
+    w[87] = 1 << 14;
+    w[88] = 0x3f | (1 << 13);
+    w[93] = 1 | (1 << 14) | 0x2000;
+    w[100] = nb as u16;
+    w[101] = (nb >> 16) as u16;
+    w[102] = (nb >> 32) as u16;
+    w[103] = (nb >> 48) as u16;
+    w[106] = 0x6000;
+    w[169] = 1; // TRIM supported
+    w
+}
+
 fn atapi_identify(serial: &str) -> [u16; 256] {
     let mut w = [0u16; 256];
     // Removable CD-ROM, 50 us DRQ response, 12-byte packets.
@@ -1241,6 +1763,18 @@ pub struct IdeChannel {
 }
 
 impl IdeChannel {
+    /// The disk geometry of drive `unit`, for the CMOS setup QEMU's
+    /// `pc_cmos_init` does. None if the slot holds no hard disk.
+    pub fn disk_geometry(&self, unit: usize) -> Option<Geometry> {
+        let d = &self.drives[unit];
+        d.is_disk().then(|| Geometry {
+            cylinders: d.cylinders,
+            heads: d.drive_heads,
+            sectors: d.drive_sectors,
+            translation: d.translation,
+        })
+    }
+
     /// A channel wired as QEMU's secondary channel (the reference machine's
     /// CD slot): drive serials are QM00003 and QM00004. Use
     /// [`IdeChannel::new_on_channel`] for the primary.
@@ -1301,7 +1835,7 @@ impl IdeChannel {
         let v = match reg {
             1 if hidden => 0,
             1 => pick(s.error, s.hob_feature),
-            2 => pick(s.nsector, s.hob_nsector),
+            2 => pick(s.nsector as u8, s.hob_nsector),
             3 => pick(s.sector, s.hob_sector),
             4 => pick(s.lcyl, s.hob_lcyl),
             5 => pick(s.hcyl, s.hob_hcyl),
@@ -1335,7 +1869,14 @@ impl IdeChannel {
         self.bus.devctl &= !CTRL_HOB;
         match reg {
             1 => self.shift_in(val, |d| (&mut d.feature, &mut d.hob_feature)),
-            2 => self.shift_in(val, |d| (&mut d.nsector, &mut d.hob_nsector)),
+            2 => {
+                // QEMU keeps the (possibly 16-bit) count and truncates it
+                // into the HOB byte.
+                for d in &mut self.drives {
+                    d.hob_nsector = d.nsector as u8;
+                    d.nsector = u32::from(val);
+                }
+            }
             3 => self.shift_in(val, |d| (&mut d.sector, &mut d.hob_sector)),
             4 => self.shift_in(val, |d| (&mut d.lcyl, &mut d.hob_lcyl)),
             5 => self.shift_in(val, |d| (&mut d.hcyl, &mut d.hob_hcyl)),
@@ -1741,21 +2282,30 @@ mod tests {
     fn replay_reference_trace() {
         use std::io::BufRead;
 
-        let path = std::env::var("TEMPLEOS_TRACE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| workspace_root().join("ref/boot/trace.log"));
+        let env_path = |name: &str| std::env::var_os(name).map(|p| workspace_root().join(p));
+        let path = env_path("TEMPLEOS_TRACE").unwrap_or_else(|| workspace_root().join("ref/boot/trace.log"));
         let Ok(file) = std::fs::File::open(&path) else {
             eprintln!("skipping: trace {} not found", path.display());
             return;
         };
-        let Some(iso) = load_iso() else {
-            eprintln!("skipping: payload/TempleOS.ISO not found");
-            return;
+        // TEMPLEOS_CD=none: the run had no CD. TEMPLEOS_HDD: raw image the
+        // run's primary master started from; TEMPLEOS_HDD_FINAL: the image
+        // QEMU left, compared with the model's at the end.
+        let cd = if std::env::var("TEMPLEOS_CD").is_ok_and(|v| v == "none") {
+            None
+        } else {
+            let Some(iso) = load_iso() else {
+                eprintln!("skipping: payload/TempleOS.ISO not found");
+                return;
+            };
+            Some(Media::Cdrom(iso))
         };
-        let mut chans = [
-            IdeChannel::new_on_channel(0, None, None),
-            IdeChannel::new_on_channel(1, Some(Media::Cdrom(iso)), None),
-        ];
+        let hdd_image = env_path("TEMPLEOS_HDD").map(|p| {
+            let img = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            std::sync::Arc::new(std::sync::Mutex::new(img))
+        });
+        let hdd = hdd_image.clone().map(|img| Media::Disk(Box::new(SharedDisk(img)) as Box<dyn DiskImage>));
+        let mut chans = [IdeChannel::new_on_channel(0, hdd, None), IdeChannel::new_on_channel(1, cd, None)];
 
         let (mut reads, mut matched, mut skipped_busy, mut writes) = (0u64, 0u64, 0u64, 0u64);
         let mut mismatches = Vec::new();
@@ -1819,5 +2369,37 @@ mod tests {
         }
         assert!(reads > 0, "no IDE accesses in the trace");
         assert!(mismatches.is_empty(), "{} mismatching reads", mismatches.len());
+        if let (Some(img), Some(final_path)) = (hdd_image, env_path("TEMPLEOS_HDD_FINAL")) {
+            let want = std::fs::read(&final_path).unwrap();
+            let got = img.lock().unwrap();
+            let diff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(got.len(), want.len());
+            assert_eq!(diff, 0, "model disk differs from {} in {diff} bytes", final_path.display());
+            eprintln!("disk image matches {}", final_path.display());
+        }
+    }
+
+    /// A MemDisk the test can still look at after handing it to a drive.
+    struct SharedDisk(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl DiskImage for SharedDisk {
+        fn sectors(&self) -> u64 {
+            self.0.lock().unwrap().len() as u64 / 512
+        }
+        fn read(&mut self, lba: u64, buf: &mut [u8]) -> io::Result<()> {
+            let img = self.0.lock().unwrap();
+            let at = lba as usize * 512;
+            buf.copy_from_slice(img.get(at..at + buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?);
+            Ok(())
+        }
+        fn write(&mut self, lba: u64, buf: &[u8]) -> io::Result<()> {
+            let mut img = self.0.lock().unwrap();
+            let at = lba as usize * 512;
+            img.get_mut(at..at + buf.len()).ok_or(io::ErrorKind::UnexpectedEof)?.copy_from_slice(buf);
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
