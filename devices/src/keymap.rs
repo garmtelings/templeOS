@@ -121,6 +121,123 @@ impl KeyMapper {
     }
 }
 
+/// What a host key combination asks the frontend to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostAction {
+    None,
+    ReleaseMouse,
+    ToggleFullscreen,
+}
+
+const LEFT_CTRL: HostKey = HostKey { code: 0x1d, e0: false };
+const ENTER: u8 = 0x1c;
+const F: u8 = 0x21;
+
+/// The VMM's host keys, decided before a key reaches the guest:
+///
+/// - **Right Ctrl** (VirtualBox style): pressed and released alone it
+///   releases the mouse; with F or Enter it toggles fullscreen. Right Ctrl
+///   and the keys pressed with it never reach the guest.
+/// - **Ctrl+Alt** (QEMU style, for keyboards without a Right Ctrl): left
+///   Ctrl and either Alt pressed together and released without another key
+///   release the mouse; Ctrl+Alt+Enter toggles fullscreen. Ctrl and Alt still
+///   go to the guest (TempleOS's Ctrl+Alt+letter shortcuts keep working); only
+///   the Enter of Ctrl+Alt+Enter is kept from it, a combination TempleOS
+///   doesn't bind.
+#[derive(Default)]
+pub struct HostKeys {
+    host_down: bool,
+    host_used: bool,
+    /// Keys used in a host combination: their release is swallowed too.
+    consumed: std::collections::HashSet<HostKey>,
+    ctrl: bool,
+    /// Held Alt keys: bit 0 left, bit 1 right.
+    alts: u8,
+    /// Another key was pressed while Ctrl+Alt were held.
+    chord_used: bool,
+}
+
+impl HostKeys {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Classify one key event: whether the guest should get it, and what
+    /// the frontend should do.
+    pub fn key(&mut self, key: HostKey, e1: bool, pressed: bool) -> (bool, HostAction) {
+        if e1 {
+            // Pause's first half: never a host key, and not Ctrl either.
+            if pressed && self.chord() {
+                self.chord_used = true;
+            }
+            return (true, HostAction::None);
+        }
+        if key == HostKey::RIGHT_CTRL {
+            if pressed {
+                if !self.host_down {
+                    self.host_down = true;
+                    self.host_used = false;
+                }
+                return (false, HostAction::None);
+            }
+            self.host_down = false;
+            let action = if self.host_used { HostAction::None } else { HostAction::ReleaseMouse };
+            return (false, action);
+        }
+        if self.host_down && pressed {
+            self.host_used = true;
+            self.consumed.insert(key);
+            let action = match key.code {
+                F if !key.e0 => HostAction::ToggleFullscreen,
+                ENTER => HostAction::ToggleFullscreen,
+                _ => HostAction::None,
+            };
+            return (false, action);
+        }
+        if !pressed && self.consumed.remove(&key) {
+            return (false, HostAction::None);
+        }
+
+        let is_ctrl = key == LEFT_CTRL;
+        let is_alt = key.code == 0x38;
+        let was_chord = self.chord();
+        if is_ctrl || is_alt {
+            if is_ctrl {
+                self.ctrl = pressed;
+            } else {
+                let bit = if key.e0 { 2 } else { 1 };
+                self.alts = if pressed { self.alts | bit } else { self.alts & !bit };
+            }
+            if pressed && self.chord() && !was_chord {
+                self.chord_used = false;
+            }
+            if !pressed && was_chord && !std::mem::replace(&mut self.chord_used, true) {
+                return (true, HostAction::ReleaseMouse);
+            }
+            return (true, HostAction::None);
+        }
+        if pressed && was_chord {
+            self.chord_used = true;
+            if key.code == ENTER {
+                self.consumed.insert(key);
+                return (false, HostAction::ToggleFullscreen);
+            }
+        }
+        (true, HostAction::None)
+    }
+
+    /// Ctrl and an Alt are both held.
+    fn chord(&self) -> bool {
+        self.ctrl && self.alts != 0
+    }
+
+    /// Forget all held keys (the window lost focus; the frontend releases
+    /// the guest's keys itself).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +281,81 @@ mod tests {
         assert_eq!(m.translate(0x37, true, false, true), [0xe0, 0x12, 0xe0, 0x7c]);
         assert_eq!(m.translate(0x37, true, false, false), [0xe0, 0xf0, 0x7c, 0xe0, 0xf0, 0x12]);
         assert_eq!(set2_to_set1(&[0xe0, 0x12, 0xe0, 0x7c]), [0xe0, 0x2a, 0xe0, 0x37]);
+    }
+
+    const A: HostKey = HostKey { code: 0x1e, e0: false };
+    const X: HostKey = HostKey { code: 0x2d, e0: false };
+    const LALT: HostKey = HostKey { code: 0x38, e0: false };
+    const RALT: HostKey = HostKey { code: 0x38, e0: true };
+    const KEY_F: HostKey = HostKey { code: 0x21, e0: false };
+    const KEY_ENTER: HostKey = HostKey { code: 0x1c, e0: false };
+
+    fn press(h: &mut HostKeys, k: HostKey) -> (bool, HostAction) {
+        h.key(k, false, true)
+    }
+
+    fn release(h: &mut HostKeys, k: HostKey) -> (bool, HostAction) {
+        h.key(k, false, false)
+    }
+
+    #[test]
+    fn right_ctrl_alone_releases_the_mouse() {
+        let mut h = HostKeys::new();
+        assert_eq!(press(&mut h, HostKey::RIGHT_CTRL), (false, HostAction::None));
+        assert_eq!(press(&mut h, HostKey::RIGHT_CTRL), (false, HostAction::None), "typematic repeat");
+        assert_eq!(release(&mut h, HostKey::RIGHT_CTRL), (false, HostAction::ReleaseMouse));
+    }
+
+    #[test]
+    fn right_ctrl_combinations_stay_on_the_host() {
+        let mut h = HostKeys::new();
+        press(&mut h, HostKey::RIGHT_CTRL);
+        assert_eq!(press(&mut h, KEY_F), (false, HostAction::ToggleFullscreen));
+        assert_eq!(release(&mut h, HostKey::RIGHT_CTRL), (false, HostAction::None));
+        assert_eq!(release(&mut h, KEY_F), (false, HostAction::None), "F's release swallowed too");
+        assert_eq!(press(&mut h, KEY_F), (true, HostAction::None));
+    }
+
+    #[test]
+    fn ctrl_alt_tap_releases_the_mouse_and_still_reaches_the_guest() {
+        let mut h = HostKeys::new();
+        assert_eq!(press(&mut h, LEFT_CTRL), (true, HostAction::None));
+        assert_eq!(press(&mut h, LALT), (true, HostAction::None));
+        assert_eq!(press(&mut h, LALT), (true, HostAction::None), "typematic repeat");
+        assert_eq!(release(&mut h, LALT), (true, HostAction::ReleaseMouse));
+        assert_eq!(release(&mut h, LEFT_CTRL), (true, HostAction::None), "only once");
+        // Alt first, right Alt, works the same.
+        press(&mut h, RALT);
+        press(&mut h, LEFT_CTRL);
+        assert_eq!(release(&mut h, LEFT_CTRL), (true, HostAction::ReleaseMouse));
+        release(&mut h, RALT);
+    }
+
+    #[test]
+    fn templeos_ctrl_alt_shortcuts_are_not_host_keys() {
+        let mut h = HostKeys::new();
+        press(&mut h, LEFT_CTRL);
+        press(&mut h, LALT);
+        assert_eq!(press(&mut h, X), (true, HostAction::None), "Ctrl+Alt+X kills a task");
+        assert_eq!(release(&mut h, X), (true, HostAction::None));
+        assert_eq!(release(&mut h, LALT), (true, HostAction::None));
+        assert_eq!(release(&mut h, LEFT_CTRL), (true, HostAction::None));
+        // Ctrl alone, Alt alone, Ctrl+A: nothing for the host.
+        press(&mut h, LEFT_CTRL);
+        assert_eq!(press(&mut h, A), (true, HostAction::None));
+        assert_eq!(release(&mut h, LEFT_CTRL), (true, HostAction::None));
+    }
+
+    #[test]
+    fn ctrl_alt_enter_toggles_fullscreen() {
+        let mut h = HostKeys::new();
+        press(&mut h, LEFT_CTRL);
+        press(&mut h, LALT);
+        assert_eq!(press(&mut h, KEY_ENTER), (false, HostAction::ToggleFullscreen));
+        assert_eq!(release(&mut h, KEY_ENTER), (false, HostAction::None));
+        assert_eq!(release(&mut h, LALT), (true, HostAction::None));
+        release(&mut h, LEFT_CTRL);
+        assert_eq!(press(&mut h, KEY_ENTER), (true, HostAction::None));
     }
 
     #[test]

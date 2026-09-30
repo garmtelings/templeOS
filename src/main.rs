@@ -26,8 +26,9 @@ usage: templeos [options]
   --headless          run without a window
   --fullscreen        start fullscreen
 
-In the window: click to capture the mouse, Right Ctrl releases it,
-Right Ctrl+F toggles fullscreen. All other keys go to TempleOS.
+In the window: click to capture the mouse. Right Ctrl, or Ctrl+Alt pressed
+and released together, releases it. Right Ctrl+F or Ctrl+Alt+Enter toggles
+fullscreen. All other keys go to TempleOS.
   --mem MIB           guest RAM in MiB (default 1024, minimum 512)
   --until MILESTONE   stop at bios-banner, long-mode or kernel-timers
   --seconds N         stop after N seconds of wall time

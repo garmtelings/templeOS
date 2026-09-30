@@ -2,16 +2,17 @@
 //!
 //! - Windowed: the picture at the largest whole-number scale that fits the
 //!   client area (sharp pixels), centered on black. Below 1x it shrinks to fit.
-//! - Fullscreen (host key + F or Enter toggles): borderless on the current
+//! - Fullscreen (Right Ctrl+F, Right Ctrl+Enter or Ctrl+Alt+Enter toggles): borderless on the current
 //!   monitor, as large as fits with the shape a real monitor gives it (see
 //!   [`Frame::fit`]).
 //!
 //! Input, as in VirtualBox: the keyboard goes to TempleOS whenever the
 //! window has focus (read with Raw Input, so Alt, F10 and Pause arrive as
 //! real key events and the window menu never opens). Clicking the picture
-//! captures the mouse (hidden and confined to the window); the host key,
-//! Right Ctrl, releases it. The host key itself and host key combinations
-//! never reach the guest. Keys still held when the window loses focus are
+//! captures the mouse (hidden and confined to the window); a host key
+//! releases it: Right Ctrl, or Ctrl+Alt pressed and released together
+//! (for keyboards without a Right Ctrl). See [`HostKeys`] for exactly which
+//! keys stay on the host. Keys still held when the window loses focus are
 //! released in the guest, so nothing sticks.
 //!
 //! The VM thread never touches the window: it stores each frame in [`Shared`]
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use devices::input::{InputEvent, InputQueue};
-use devices::keymap::{HostKey, KeyMapper};
+use devices::keymap::{HostAction, HostKey, HostKeys, KeyMapper};
 use devices::vga_render::Frame;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -108,11 +109,8 @@ struct UiState {
     keymap: KeyMapper,
     /// Keys the guest has seen pressed and not released.
     pressed: HashSet<HostKey>,
-    /// Keys used in a host key combination: their release is swallowed too.
-    host_consumed: HashSet<HostKey>,
-    /// The host key is down; `host_used` if another key was pressed with it.
-    host_down: bool,
-    host_used: bool,
+    /// Decides which keys are host keys (Right Ctrl, Ctrl+Alt).
+    host_keys: HostKeys,
     /// The mouse is captured: hidden, confined, and its motion goes to the guest.
     captured: bool,
     /// Mouse buttons the guest has seen held (PS/2 bit order).
@@ -164,9 +162,7 @@ pub fn run(shared: Arc<Shared>, fullscreen: bool, start: impl FnOnce()) -> Resul
                 fullscreen: None,
                 keymap: KeyMapper::new(),
                 pressed: HashSet::new(),
-                host_consumed: HashSet::new(),
-                host_down: false,
-                host_used: false,
+                host_keys: HostKeys::new(),
                 captured: false,
                 buttons: 0,
                 wheel_rest: 0,
@@ -389,7 +385,7 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
 }
 
 const TITLE_FREE: PCWSTR = w!("TempleOS - click to capture the mouse");
-const TITLE_CAPTURED: PCWSTR = w!("TempleOS - Right Ctrl releases the mouse");
+const TITLE_CAPTURED: PCWSTR = w!("TempleOS - Right Ctrl or Ctrl+Alt releases the mouse");
 
 fn captured() -> bool {
     UI.with(|ui| ui.borrow().as_ref().is_some_and(|ui| ui.captured))
@@ -450,16 +446,8 @@ fn release_all_keys() {
                 ui.shared.input.push(InputEvent::Key(bytes));
             }
         }
-        ui.host_down = false;
-        ui.host_consumed.clear();
+        ui.host_keys.reset();
     });
-}
-
-/// What the host key combinations do.
-enum HostAction {
-    None,
-    ReleaseMouse,
-    ToggleFullscreen,
 }
 
 unsafe fn raw_input(hwnd: HWND, handle: HRAWINPUT) {
@@ -505,27 +493,9 @@ unsafe fn raw_input(hwnd: HWND, handle: HRAWINPUT) {
 }
 
 fn key_event(ui: &mut UiState, key: HostKey, e1: bool, pressed: bool) -> HostAction {
-    if key == HostKey::RIGHT_CTRL && !e1 {
-        if pressed {
-            if !ui.host_down {
-                ui.host_down = true;
-                ui.host_used = false;
-            }
-            return HostAction::None;
-        }
-        ui.host_down = false;
-        return if ui.host_used { HostAction::None } else { HostAction::ReleaseMouse };
-    }
-    if ui.host_down && pressed {
-        ui.host_used = true;
-        ui.host_consumed.insert(key);
-        return match (key.code, key.e0) {
-            (0x21, false) | (0x1c, _) => HostAction::ToggleFullscreen, // F, Enter
-            _ => HostAction::None,
-        };
-    }
-    if !pressed && ui.host_consumed.remove(&key) {
-        return HostAction::None;
+    let (to_guest, action) = ui.host_keys.key(key, e1, pressed);
+    if !to_guest {
+        return action;
     }
     let bytes = ui.keymap.translate(key.code, key.e0, e1, pressed);
     if !e1 {
@@ -538,7 +508,7 @@ fn key_event(ui: &mut UiState, key: HostKey, e1: bool, pressed: bool) -> HostAct
     if !bytes.is_empty() {
         ui.shared.input.push(InputEvent::Key(bytes));
     }
-    HostAction::None
+    action
 }
 
 fn mouse_event(ui: &mut UiState, m: &RAWMOUSE) {

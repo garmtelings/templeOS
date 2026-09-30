@@ -231,9 +231,16 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   motion, five buttons and the wheel as PS/2 packets. TempleOS's IntelliMouse
   detection finds a wheel mouse and gets 4-byte packets (tested end to end
   by replaying its `KbdInit`/`MsHardRst` port sequence on the board model).
-- [x] Host key Right Ctrl, as in VirtualBox: alone it releases the mouse;
-  Right Ctrl+F or +Enter toggles fullscreen. Neither reaches the guest. Keys
-  held when the window loses focus are released in the guest.
+- [x] Host keys (`devices::keymap::HostKeys`, unit tested):
+  - Right Ctrl, as in VirtualBox: alone it releases the mouse; Right Ctrl+F
+    or +Enter toggles fullscreen. Neither reaches the guest.
+  - Ctrl+Alt, as in QEMU, for keyboards without a Right Ctrl: pressed and
+    released together with no other key it releases the mouse;
+    Ctrl+Alt+Enter toggles fullscreen. Ctrl and Alt still reach the guest,
+    so TempleOS's Ctrl+Alt+letter shortcuts (A B C D F G L M N S T V X Z,
+    Del) keep working; only the Enter of Ctrl+Alt+Enter, which TempleOS
+    doesn't bind, is kept from it.
+  - Keys held when the window loses focus are released in the guest.
 - [x] Input crosses from the UI thread to the VM thread through
   `devices::input::InputQueue` (mouse motion merged, button changes kept in
   order) and is delivered between vCPU runs.
@@ -243,8 +250,7 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   lengths are as the guest timed them. Tested with TempleOS's `Snd()` port
   sequence. No audio device: silent, with a note on stderr.
 - Not done: the Windows key still opens the Start menu (would need a
-  low-level keyboard hook); a host key other than Right Ctrl isn't
-  configurable.
+  low-level keyboard hook).
 - **Milestone: interactive shell, hymns play.** Not yet confirmed: needs a
   run on Windows with the ISO.
 
