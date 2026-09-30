@@ -35,9 +35,25 @@ impl<T> Context<T> for windows::core::Result<T> {
     }
 }
 
-/// True when the hypervisor is running and the Windows Hypervisor Platform
-/// feature is enabled.
-pub fn hypervisor_present() -> bool {
+/// Why WHPX can't be used on this machine, with what to do about it; `Ok`
+/// when it can. The exe delay-loads the WHPX DLLs, so this must run (and
+/// succeed) before any other WHv call: calling into a missing delay-loaded
+/// DLL crashes.
+pub fn check_available() -> std::result::Result<(), String> {
+    use windows::core::w;
+    use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    // SAFETY: loading system DLLs by name; they stay loaded for the process.
+    let dlls = unsafe {
+        LoadLibraryExW(w!("WinHvPlatform.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).is_ok()
+            && LoadLibraryExW(w!("WinHvEmulation.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).is_ok()
+    };
+    if !dlls {
+        return Err("TempleOS needs the Windows Hypervisor Platform, which is not installed.\n\n\
+                    Turn it on in an administrator PowerShell:\n    \
+                    Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform\n\
+                    (or: Turn Windows features on or off > Windows Hypervisor Platform), then restart Windows."
+            .into());
+    }
     let mut present = 0u32;
     // SAFETY: the buffer is a u32, which is what this capability returns.
     let r = unsafe {
@@ -48,7 +64,15 @@ pub fn hypervisor_present() -> bool {
             None,
         )
     };
-    r.is_ok() && present != 0
+    if r.is_err() || present == 0 {
+        return Err("The Windows Hypervisor Platform is installed but the hypervisor is not running.\n\n\
+                    - If you just turned the feature on, restart Windows.\n\
+                    - Otherwise turn on virtualization (Intel VT-x / AMD-V, often called SVM) in the \
+                    BIOS/UEFI settings, then check in an administrator PowerShell:\n    \
+                    bcdedit /set hypervisorlaunchtype auto"
+            .into());
+    }
+    Ok(())
 }
 
 /// Guest access rights for a mapping.

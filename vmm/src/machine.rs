@@ -307,13 +307,7 @@ const BSP: u32 = 0;
 
 impl Machine {
     pub fn new(cfg: Config) -> Result<Self> {
-        if !whpx::hypervisor_present() {
-            return Err(Error(
-                "the Windows Hypervisor Platform is not available. Enable it with (admin PowerShell):\n  \
-                 Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform\nthen reboot."
-                    .into(),
-            ));
-        }
+        whpx::check_available().map_err(Error)?;
         let cpus = cfg.cpus.clamp(1, MAX_CPUS);
         let cpuid = Cpuid::qemu64_smp(cpus);
         let part = Arc::new(Partition::new(cpus, &cpuid.leaves())?);

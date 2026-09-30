@@ -348,6 +348,31 @@ runs the first two in one go and writes `phase6-results/summary.txt`:
 - Friendly first-run error if WHPX is off, including a one-line PowerShell
   command to enable it.
 
+Done:
+- [x] **Static exe**: static CRT (`.cargo/config.toml`), no Visual C++
+  redistributable. `tools/pe_imports.py --check` fails the build unless every
+  load-time import is part of Windows.
+- [x] **Starts without WHPX**: the WHPX DLLs are delay-loaded (build.rs,
+  MSVC), and `whpx::check_available` probes for them before any WHv call.
+  Two messages: feature not installed (the PowerShell command), or
+  installed but the hypervisor isn't running (restart, VT-x/AMD-V in the
+  firmware, `bcdedit /set hypervisorlaunchtype auto`).
+- [x] **Reproducible**: toolchain pinned (`rust-toolchain.toml`),
+  `Cargo.lock` with `--locked`, build paths remapped out of the binary,
+  deterministic link (`/Brepro`, `/PDBALTPATH:%_PDB%`).
+  `tools/build-release.ps1` makes `dist/TempleOS.exe` + `.sha256` + `.pdb`.
+- [x] **CI** (`.github/workflows/build.yml`): device tests and a 2M-op fuzz
+  run on Linux; on Windows fetch and verify the ISO (cached), run all tests,
+  build the release, build it again from another folder and require the same
+  hash, upload the exe. A `v*` tag publishes a GitHub release.
+  Hosted runners can't boot the VM (no nested virtualization); booting stays
+  with `tools/phase6-windows.ps1` on a real PC.
+
+Not done:
+- [ ] First green CI run (the MSVC link options are untested until then).
+- [ ] Optional: an Authenticode signature (needs a certificate), an icon
+  and version resource.
+
 ### Phase 8 (optional) — No-hypervisor fallback
 - For machines without virtualization, embed a software x86-64 CPU. To keep
   it "byte-instruction perfect" this must be a proven core (e.g. the Bochs

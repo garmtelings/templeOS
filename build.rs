@@ -3,6 +3,12 @@
 //! payload/TempleOS.ISO.pin). The pinned hashes are also handed to the
 //! program (PAYLOAD_SHA256_<NAME>), which checks the embedded copies again
 //! every time it starts.
+//!
+//! It also sets the MSVC link options the release exe relies on: the WHPX
+//! DLLs are delay-loaded, so the exe starts (and explains what to turn on)
+//! on a PC without the Windows Hypervisor Platform; and the link is
+//! deterministic (no timestamp, PDB referenced by file name only), so the
+//! same sources and toolchain give the same exe.
 
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -47,6 +53,18 @@ fn main() {
         .expect("payload/TempleOS.ISO.pin has no sha256; run tools/fetch-payload.sh");
     check(&payload.join("TempleOS.ISO"), iso_sha.trim());
     emit("TempleOS.ISO", iso_sha.trim());
+
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for arg in [
+            "/DELAYLOAD:WinHvPlatform.dll",
+            "/DELAYLOAD:WinHvEmulation.dll",
+            "delayimp.lib",
+            "/Brepro",
+            "/PDBALTPATH:%_PDB%",
+        ] {
+            println!("cargo:rustc-link-arg-bins={arg}");
+        }
+    }
 }
 
 /// PAYLOAD_SHA256_BIOS for bios.bin, and so on.

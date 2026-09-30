@@ -1,0 +1,101 @@
+# Builds TempleOS.exe on every push and pull request; a v* tag also publishes
+# it as a GitHub release with its SHA-256.
+#
+# Hosted runners have no nested virtualization, so the VM itself isn't booted
+# here: the device tests, the fuzzer and the QEMU-trace replays run, and the
+# exe is checked for its imports and for being reproducible. Booting is
+# tools/phase6-windows.ps1, on a real Windows PC.
+
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  devices:
+    name: device models (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Device and CPUID tests
+        run: cargo test --locked -p devices -p vmm
+      - name: Longer fuzz run
+        run: cargo test --locked -p devices --release --test fuzz_board -- --nocapture
+        env:
+          TEMPLEOS_FUZZ_ITERS: '2000000'
+
+  windows:
+    name: TempleOS.exe
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the ISO
+        uses: actions/cache@v4
+        with:
+          path: payload/TempleOS.ISO
+          key: templeos-iso-${{ hashFiles('payload/TempleOS.ISO.pin') }}
+      - name: Fetch and verify the ISO
+        shell: bash
+        run: tools/fetch-payload.sh
+
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - name: Tests
+        run: cargo test --locked --workspace
+
+      - name: Release build
+        shell: pwsh
+        run: tools/build-release.ps1 -OutDir dist
+
+      - name: Reproducible (second build in another folder)
+        shell: pwsh
+        run: |
+          $other = Join-Path $env:RUNNER_TEMP 'repro'
+          git worktree add $other HEAD
+          Copy-Item payload/TempleOS.ISO (Join-Path $other 'payload')
+          Push-Location $other
+          ./tools/build-release.ps1 -OutDir dist -TargetDir (Join-Path $env:RUNNER_TEMP 'repro-target')
+          Pop-Location
+          $a = (Get-FileHash dist/TempleOS.exe).Hash
+          $b = (Get-FileHash (Join-Path $other 'dist/TempleOS.exe')).Hash
+          if ($a -ne $b) { Write-Error "not reproducible: $a vs $b"; exit 1 }
+          Write-Host "reproducible: $a"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TempleOS-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [devices, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TempleOS-${{ github.sha }}
+          path: dist
+      - name: Check the hash
+        working-directory: dist
+        run: sha256sum -c TempleOS.exe.sha256
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "TempleOS.exe $GITHUB_REF_NAME" \
+            --notes "TempleOS V5.03 (official ISO, unmodified) in one Windows exe. Needs Windows 10/11 x64 with the Windows Hypervisor Platform turned on. SHA-256: $(cut -d' ' -f1 dist/TempleOS.exe.sha256)" \
+            dist/TempleOS.exe dist/TempleOS.exe.sha256 dist/TempleOS.pdb
