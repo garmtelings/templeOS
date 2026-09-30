@@ -24,7 +24,11 @@ pub struct Cpuid {
 
 impl Cpuid {
     pub fn qemu64() -> Self {
-        let entries = TABLE
+        Self::parse(TABLE)
+    }
+
+    fn parse(text: &str) -> Self {
+        let entries = text
             .lines()
             .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
             .map(|l| {
@@ -40,6 +44,35 @@ impl Cpuid {
             })
             .collect();
         Cpuid { entries }
+    }
+
+    /// `qemu64` as QEMU 8.2 presents it with `-smp n` (one socket of n
+    /// cores, one thread each): the logical processor count and topology
+    /// bits change, nothing else (checked against captures for 2, 4 and 8
+    /// CPUs in docs/ref/cpuid-qemu64-smpN.txt).
+    pub fn qemu64_smp(n: u32) -> Self {
+        let mut c = Self::qemu64();
+        if n <= 1 {
+            return c;
+        }
+        // Bits needed for a core ID: ceil(log2(n)).
+        let bits = 32 - (n - 1).leading_zeros();
+        for (leaf, sub, r) in &mut c.entries {
+            match (*leaf, *sub) {
+                (1, _) => {
+                    r.ebx = (r.ebx & !0x00ff_0000) | (n.min(255) << 16);
+                    r.edx |= 1 << 28; // HTT
+                }
+                (0xb, 1) => {
+                    r.eax = bits;
+                    r.ebx = n;
+                }
+                (0x8000_0001, _) => r.ecx |= 1 << 1, // CmpLegacy
+                (0x8000_0008, _) => r.ecx = (bits << 12) | (n - 1),
+                _ => {}
+            }
+        }
+        c
     }
 
     /// Every leaf in the table; the hypervisor exits to us for these.
@@ -87,6 +120,22 @@ mod tests {
         assert_ne!(c.query(0x8000_0001, 0, 0).edx & 1 << 29, 0, "long mode");
         assert_ne!(c.query(1, 0, 0).edx & 1 << 9, 0, "APIC");
         assert_eq!(c.query(1, 0, 3).ebx >> 24, 3);
+    }
+
+    fn table(text: &str) -> Vec<(u32, u32, Regs)> {
+        Cpuid::parse(text).entries
+    }
+
+    #[test]
+    fn smp_matches_qemu_captures() {
+        for (n, text) in [
+            (2, include_str!("../../docs/ref/cpuid-qemu64-smp2.txt")),
+            (4, include_str!("../../docs/ref/cpuid-qemu64-smp4.txt")),
+            (8, include_str!("../../docs/ref/cpuid-qemu64-smp8.txt")),
+        ] {
+            assert_eq!(Cpuid::qemu64_smp(n).entries, table(text), "-smp {n}");
+        }
+        assert_eq!(Cpuid::qemu64_smp(1).entries, Cpuid::qemu64().entries);
     }
 
     #[test]

@@ -78,6 +78,26 @@ pub struct GuestMemory {
     bios: HostBuf,
 }
 
+// SAFETY: guest memory is shared by the vCPU threads, as it is by the vCPUs
+// themselves. Host-side writes go through raw pointers
+// ([`GuestMemory::write_shared`]); no Rust reference into it is held across
+// a guest run.
+unsafe impl Sync for GuestMemory {}
+
+/// A `devices::GuestMemory` view that writes through a shared reference
+/// (fw_cfg DMA and the instruction emulator, on any vCPU thread).
+pub struct MemRef<'a>(pub &'a GuestMemory);
+
+impl devices::GuestMemory for MemRef<'_> {
+    fn read(&self, gpa: u64, buf: &mut [u8]) -> bool {
+        devices::GuestMemory::read(self.0, gpa, buf)
+    }
+
+    fn write(&mut self, gpa: u64, data: &[u8]) -> bool {
+        self.0.write_shared(gpa, data)
+    }
+}
+
 impl GuestMemory {
     pub fn new(ram_size: u64, bios: &[u8]) -> Self {
         assert_eq!(bios.len(), BIOS_SIZE, "BIOS image must be {BIOS_SIZE} bytes");
@@ -130,6 +150,24 @@ impl GuestMemory {
             Some((&self.bios, (gpa - BIOS_BASE) as usize))
         } else {
             None
+        }
+    }
+}
+
+impl GuestMemory {
+    /// Write guest RAM from any thread: what a DMA-ing device would do.
+    /// Writes to the flash are dropped; the VGA window is not memory.
+    pub fn write_shared(&self, gpa: u64, data: &[u8]) -> bool {
+        let end = gpa.saturating_add(data.len() as u64);
+        if gpa < VGA_HOLE.end && end > VGA_HOLE.start {
+            false
+        } else if end <= self.ram.len() as u64 {
+            // SAFETY: in bounds of the RAM allocation, which lives as long as
+            // self; concurrent guest access is the same race real DMA has.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ram.ptr.add(gpa as usize), data.len()) };
+            true
+        } else {
+            gpa >= BIOS_BASE && end <= 1 << 32
         }
     }
 }

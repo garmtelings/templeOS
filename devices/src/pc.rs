@@ -28,7 +28,15 @@ pub struct PcConfig {
     pub hdd: Option<Box<dyn DiskImage>>,
     /// Guest wall-clock time at power-on, in Unix seconds.
     pub rtc_base: i64,
+    /// Number of CPUs (QEMU `-smp`), reported through fw_cfg and CMOS.
+    pub cpus: u8,
 }
+
+/// The VMM shares the board between vCPU threads behind a mutex.
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<Pc>();
+};
 
 pub struct Pc {
     pic: Pic,
@@ -73,7 +81,7 @@ impl Pc {
             pci,
             pm: Piix4Pm::new(),
             hpet: Hpet::new(),
-            fwcfg: fw_cfg(cfg.ram_size),
+            fwcfg: fw_cfg(cfg.ram_size, cfg.cpus.max(1)),
             vga,
             ide: [
                 IdeChannel::new_on_channel(0, cfg.hdd.map(Media::Disk), None),
@@ -85,17 +93,17 @@ impl Pc {
             kernel_timer: false,
             trace: None,
         };
-        pc.init_cmos(cfg.ram_size);
+        pc.init_cmos(cfg.ram_size, cfg.cpus.max(1));
         pc
     }
 
     /// CMOS configuration bytes as QEMU's pc_cmos_init and
-    /// pc_cmos_init_late write them for this machine: no floppy, one CPU.
+    /// pc_cmos_init_late write them for this machine: no floppy, `cpus` CPUs.
     /// Without a hard disk it boots from the CD (the reference machine's
     /// `-boot d`); with one it uses QEMU's default order, hard disk first
     /// and CD last, so an installed TempleOS boots from the disk and a blank
     /// disk falls through to the CD.
-    fn init_cmos(&mut self, ram_size: u64) {
+    fn init_cmos(&mut self, ram_size: u64, cpus: u8) {
         let kib = ram_size / 1024;
         let ext_kib = (kib.saturating_sub(1024)).min(0xFFFF) as u16;
         let above_16m = (ram_size.saturating_sub(16 << 20) / 65536).min(0xFFFF) as u16;
@@ -111,7 +119,7 @@ impl Pc {
             (0x35, (above_16m >> 8) as u8),
             (0x38, 0x00), // third boot device none, floppy signature check on
             (0x3D, 0x03), // first boot device CD-ROM
-            (0x5F, 0x00), // CPUs - 1
+            (0x5F, cpus - 1), // CPUs - 1
         ];
         for (index, val) in bytes {
             self.rtc.set_nvram(index, val);
@@ -577,11 +585,11 @@ fn le_read(buf: &[u8], off: u32, size: u8) -> u64 {
 /// neither). The e820 map matches QEMU's for this CPU: the AMD
 /// HyperTransport hole is reserved because the qemu64 model is an AMD CPU
 /// with 40 physical address bits.
-fn fw_cfg(ram_size: u64) -> FwCfg {
+fn fw_cfg(ram_size: u64, cpus: u8) -> FwCfg {
     let mut f = FwCfg::new();
     f.add_bytes(0x03, ram_size.to_le_bytes().to_vec()); // RAM_SIZE
-    f.add_bytes(0x05, 1u16.to_le_bytes().to_vec()); // NB_CPUS
-    f.add_bytes(0x0F, 1u16.to_le_bytes().to_vec()); // MAX_CPUS
+    f.add_bytes(0x05, u16::from(cpus).to_le_bytes().to_vec()); // NB_CPUS
+    f.add_bytes(0x0F, u16::from(cpus).to_le_bytes().to_vec()); // MAX_CPUS
     let mut e820 = Vec::new();
     for (addr, len, kind) in [(0xFD_0000_0000u64, 0x3_0000_0000u64, 2u32), (0, ram_size, 1)] {
         e820.extend_from_slice(&addr.to_le_bytes());
@@ -608,7 +616,7 @@ mod tests {
 
     fn pc() -> Pc {
         static ROM: [u8; 3] = [0x55, 0xaa, 0x01];
-        Pc::new(PcConfig { ram_size: 512 << 20, vgabios: &ROM, cdrom: None, hdd: None, rtc_base: 0 })
+        Pc::new(PcConfig { ram_size: 512 << 20, vgabios: &ROM, cdrom: None, hdd: None, rtc_base: 0, cpus: 1 })
     }
 
     fn out(pc: &mut Pc, port: u16, val: u8) {
@@ -726,6 +734,7 @@ mod tests {
             cdrom: None,
             hdd: Some(Box::new(crate::ide::MemDisk(img))),
             rtc_base: 0,
+            cpus: 1,
         });
         let mut cmos = |i: u8| {
             out(&mut pc, 0x70, i);

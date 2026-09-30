@@ -96,7 +96,9 @@ unsafe impl Sync for Partition {}
 
 impl Partition {
     /// Create and set up a partition with `cpus` processors, the local APIC
-    /// emulated by the hypervisor (xAPIC mode), and CPUID exits for `cpuid_leaves`.
+    /// emulated by the hypervisor (xAPIC mode), CPUID exits for
+    /// `cpuid_leaves`, and INIT/SIPI IPIs trapped to the VMM (which re-issues
+    /// them with [`Partition::request_interrupt`], as QEMU's WHPX backend does).
     pub fn new(cpus: u32, cpuid_leaves: &[u32]) -> Result<Self> {
         // SAFETY: plain FFI calls; every buffer passed matches the size given.
         unsafe {
@@ -109,8 +111,8 @@ impl Partition {
                 &WHvX64LocalApicEmulationModeXApic,
             )
             .context("set xAPIC emulation")?;
-            // Bit 0 of the extended VM exits: X64CpuidExit.
-            let exits = WHV_EXTENDED_VM_EXITS { AsUINT64: 1 };
+            // Extended VM exits: bit 0 X64CpuidExit, bit 6 X64ApicInitSipiExitTrap.
+            let exits = WHV_EXTENDED_VM_EXITS { AsUINT64: 1 | 1 << 6 };
             part.set_property(WHvPartitionPropertyCodeExtendedVmExits, &exits)
                 .context("enable CPUID exits")?;
             WHvSetPartitionProperty(
@@ -225,6 +227,41 @@ impl Partition {
             )
         }
         .context("WHvSetVirtualProcessorRegisters")
+    }
+
+    /// Deliver an interrupt through the hypervisor's local APICs (used for
+    /// INIT and SIPI). `kind` is a WHV_INTERRUPT_TYPE; destination mode
+    /// physical unless `logical`.
+    pub fn request_interrupt(&self, kind: WHV_INTERRUPT_TYPE, logical: bool, level: bool, destination: u32, vector: u32) -> Result<()> {
+        // WHV_INTERRUPT_CONTROL: Type bits 0-7, DestinationMode 8-11, TriggerMode 12-15.
+        let bits = (kind.0 as u64 & 0xff) | (u64::from(logical) << 8) | (u64::from(level) << 12);
+        let ctl = WHV_INTERRUPT_CONTROL { _bitfield: bits, Destination: destination, Vector: vector };
+        // SAFETY: ctl is a valid, correctly sized structure.
+        unsafe {
+            WHvRequestInterrupt(self.handle, &ctl, std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32)
+        }
+        .context("WHvRequestInterrupt")
+    }
+
+    /// True if the vCPU's local APIC has any interrupt requested (IRR bit
+    /// set). An error counts as pending, so a caller never waits forever.
+    pub fn apic_irr_pending(&self, vp: u32) -> bool {
+        let names = [
+            WHvX64RegisterApicIrr0,
+            WHvX64RegisterApicIrr1,
+            WHvX64RegisterApicIrr2,
+            WHvX64RegisterApicIrr3,
+            WHvX64RegisterApicIrr4,
+            WHvX64RegisterApicIrr5,
+            WHvX64RegisterApicIrr6,
+            WHvX64RegisterApicIrr7,
+        ];
+        let mut values = [WHV_REGISTER_VALUE::default(); 8];
+        match self.get_regs(vp, &names, &mut values) {
+            // SAFETY: the IRR registers are 64-bit values (low 32 bits used).
+            Ok(()) => values.iter().any(|v| unsafe { v.Reg64 } & 0xffff_ffff != 0),
+            Err(_) => true,
+        }
     }
 
     pub fn get_reg(&self, vp: u32, name: WHV_REGISTER_NAME) -> Result<WHV_REGISTER_VALUE> {

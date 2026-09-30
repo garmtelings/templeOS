@@ -30,7 +30,10 @@ In the window: click to capture the mouse. Right Ctrl, or Ctrl+Alt pressed
 and released together, releases it. Right Ctrl+F or Ctrl+Alt+Enter toggles
 fullscreen. All other keys go to TempleOS.
   --mem MIB           guest RAM in MiB (default 1024, minimum 512)
-  --until MILESTONE   stop at bios-banner, long-mode or kernel-timers
+  --cpus N            CPU cores (default: with a window, the host's cores
+                      up to 8; headless, 1)
+  --until MILESTONE   stop at bios-banner, long-mode, kernel-timers or
+                      ap-started
   --seconds N         stop after N seconds of wall time
   --iso PATH          boot this ISO instead of the embedded one
   --no-cd             boot with no CD in the drive
@@ -49,6 +52,7 @@ fullscreen. All other keys go to TempleOS.
 ";
 
 struct Args {
+    cpus: Option<u32>,
     hdd: Option<String>,
     no_hdd: bool,
     headless: bool,
@@ -69,6 +73,7 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
+        cpus: None,
         hdd: None,
         no_hdd: false,
         headless: false,
@@ -92,6 +97,13 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--headless" => a.headless = true,
             "--hdd" => a.hdd = Some(value()?),
+            "--cpus" => {
+                let n: u32 = value()?.parse().map_err(|_| "bad --cpus")?;
+                if !(1..=vmm::machine::MAX_CPUS).contains(&n) {
+                    return Err(format!("--cpus must be 1 to {}", vmm::machine::MAX_CPUS));
+                }
+                a.cpus = Some(n);
+            }
             "--no-hdd" => a.no_hdd = true,
             "--fullscreen" => a.fullscreen = true,
             "--exact-vga" => a.exact_vga = true,
@@ -102,6 +114,7 @@ fn parse_args() -> Result<Args, String> {
                     "bios-banner" => Milestone::BiosBanner,
                     "long-mode" => Milestone::LongMode,
                     "kernel-timers" => Milestone::KernelTimers,
+                    "ap-started" => Milestone::ApStarted,
                     other => return Err(format!("unknown milestone {other}")),
                 })
             }
@@ -203,6 +216,13 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
         hdd,
         rtc_base,
         vga_fast_path: !args.exact_vga,
+        cpus: args.cpus.unwrap_or_else(|| {
+            if args.headless {
+                1
+            } else {
+                std::thread::available_parallelism().map_or(1, |n| n.get() as u32).min(8)
+            }
+        }),
     })?;
     if let Some(path) = &args.debugcon {
         m.set_debugcon_sink(Box::new(File::create(path)?), !args.quiet);
@@ -331,7 +351,7 @@ fn run_headless(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.screen {
         println!("[vmm] text screen:");
-        for line in devices::vga_render::text_screen(m.pc_mut().vga()) {
+        for line in m.with_pc(|pc| devices::vga_render::text_screen(pc.vga())) {
             println!("  |{line}|");
         }
     }

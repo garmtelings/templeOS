@@ -671,7 +671,7 @@ impl Drive {
                 self.transfer_start(0, 512 * n, EndTransfer::SectorWrite);
                 false
             }
-            0x40 | 0x41 | 0x42 => {
+            0x40..=0x42 => {
                 self.lba48_transform(cmd == 0x42);
                 true
             }
@@ -1767,7 +1767,7 @@ impl IdeChannel {
     /// `pc_cmos_init` does. None if the slot holds no hard disk.
     pub fn disk_geometry(&self, unit: usize) -> Option<Geometry> {
         let d = &self.drives[unit];
-        d.is_disk().then(|| Geometry {
+        d.is_disk().then_some(Geometry {
             cylinders: d.cylinders,
             heads: d.drive_heads,
             sectors: d.drive_sectors,

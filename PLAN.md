@@ -255,13 +255,46 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   run on Windows with the ISO.
 
 ### Phase 5 — Multicore, timing and disk
-- More vCPUs (TempleOS uses all cores; default = host cores, capped at 8),
-  LAPIC IPIs, INIT/SIPI handling, I/O APIC routing.
-- Make `RDTSC`/HPET/PIT consistent with each other so `Sleep()` and the
-  frame rate are correct.
-- ATA PIO HDD backed by the sidecar image, so the in-guest `Install` works.
+- [x] **Hard disk** (`devices/src/ide.rs`): an ATA disk on the primary
+  master with QEMU 8.2's behaviour for every command SeaBIOS and TempleOS
+  use (IDENTIFY, READ/WRITE SECTORS and MULTIPLE incl. EXT, READ NATIVE MAX
+  (EXT), SET MULTIPLE MODE, VERIFY, SEEK, INITIALIZE DEVICE PARAMETERS,
+  FLUSH CACHE; SET MAX aborts as in QEMU), QEMU's geometry guess and the
+  disk CMOS bytes. Checked against QEMU with `tools/qemu-ref/disk_ref.py`,
+  a boot disk that drives the controller exactly like TempleOS's
+  `DskATA.HC` (one sector per DRQ in WRITE MULTIPLE EXT, HOB reads of READ
+  NATIVE MAX EXT...): 0 mismatches in 35,836 register reads, and the disk
+  image the model writes is byte-identical to QEMU's.
+- [x] Disk image: `TempleOS.hdd` (2 GiB, created on first run) next to the
+  exe, or in `%LOCALAPPDATA%\TempleOS` when that folder is read-only;
+  `--hdd PATH`, `--no-hdd`. Writes go straight to the file; FLUSH CACHE
+  syncs it. With a disk the boot order is QEMU's default (disk first, CD
+  last): a blank disk falls through to the CD, an installed one boots.
+- [x] **Multicore** (`vmm/src/machine.rs`): one thread per vCPU (default:
+  the host's cores up to 8 with a window, 1 headless; `--cpus N`). The
+  board is shared behind a mutex. INIT and SIPI trap to the VMM and are
+  re-issued with `WHvRequestInterrupt`, as QEMU's WHPX backend does; APs
+  start in wait-for-SIPI, and an AP's thread is parked before an INIT
+  reaches it so no stale exit handling touches the fresh state. Other IPIs
+  are delivered by the hypervisor's local APICs. A halted vCPU wakes on a
+  pending interrupt in its local APIC's IRR (polled every 250 us) or, for
+  the BSP, the PIC; with IF=0 it stays halted until INIT. CPUID reports
+  QEMU's `-smp N` topology (checked against captures for 2, 4 and 8 CPUs),
+  and fw_cfg and CMOS 0x5F the CPU count, so SeaBIOS and TempleOS find
+  every core the way they do in QEMU.
+- [x] **Timing**: PIT, HPET and RTC are computed from the one host
+  monotonic clock; the guest TSC is the host TSC (kept in step across
+  vCPUs by the hypervisor). TempleOS calibrates the TSC against the HPET
+  at boot (`TimeCal`), so `Sleep`, `tS` and the TSC agree by construction.
+- [x] The timer-kicker thread now stops with its machine (before, every
+  guest reboot leaked a partition).
+- Not modelled: the I/O APIC (the kernel never touches it; only the
+  `PCIInterrupts` demo reads it); INIT/SIPI in logical destination mode
+  without a shorthand (passed to the hypervisor as is; SeaBIOS and TempleOS
+  always use shorthands).
 - **Milestone: installs to C:, reboots from HDD, all cores show in the task
-  bar.**
+  bar.** Not yet confirmed: needs a run on Windows with the ISO. The new
+  `--until ap-started` milestone (first SIPI) is the quick multicore check.
 
 ### Phase 6 — Proving "perfect"
 - **Image integrity:** startup self-check of the embedded ISO hash. CI fails
