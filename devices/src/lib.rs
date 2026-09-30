@@ -52,6 +52,8 @@ pub mod dma;
 pub mod ps2;
 #[cfg(any(not(any(dev_only = "timers", dev_only = "ide", dev_only = "chipset", dev_only = "vga")), dev_only = "vga"))]
 pub mod vga;
+#[cfg(any(not(any(dev_only = "timers", dev_only = "ide", dev_only = "chipset", dev_only = "vga")), dev_only = "vga"))]
+pub mod vga_render;
 
 #[cfg(not(any(dev_only = "timers", dev_only = "ide", dev_only = "chipset", dev_only = "vga")))]
 pub mod pc;

@@ -3,17 +3,20 @@
 //!
 //! | Range                      | Backing                                      |
 //! |----------------------------|----------------------------------------------|
-//! | 0 .. ram_size              | RAM (including 0xA0000-0xFFFFF, see below)    |
+//! | 0 .. 0xA0000               | RAM                                          |
+//! | 0xA0000 .. 0xC0000         | not mapped: the VGA window, emulated by the   |
+//! |                            | board (or one VGA plane, mapped by the VMM)   |
+//! | 0xC0000 .. ram_size        | RAM (including 0xC0000-0xFFFFF, see below)    |
 //! | 0xFFFC0000 .. 0x1_00000000 | BIOS flash, read/execute only                 |
 //!
-//! Simplifications, both invisible to SeaBIOS and TempleOS:
+//! The RAM allocation still covers 0xA0000-0xBFFFF; those bytes are unused.
+//!
+//! Simplification, invisible to SeaBIOS and TempleOS:
 //! - 0xC0000-0xFFFFF is always RAM. QEMU routes it through the i440FX PAM
 //!   registers (reads from flash until SeaBIOS enables shadow RAM, read-only
 //!   after POST). We start it with the flash's top 128 KiB copied to 0xE0000,
 //!   so reads return what QEMU's would; the only difference is that writes
 //!   after POST aren't discarded, and nothing writes there.
-//! - 0xA0000-0xBFFFF (the VGA window) is plain RAM until the VGA memory model
-//!   lands in Phase 3.
 
 use crate::whpx::{Access, Partition, Result};
 use windows::Win32::System::Memory::{
@@ -24,6 +27,8 @@ pub const BIOS_SIZE: usize = 256 << 10;
 pub const BIOS_BASE: u64 = (1 << 32) - BIOS_SIZE as u64;
 /// Top of the RAM we support below the PCI hole (QEMU's i440FX lowmem limit).
 pub const MAX_LOW_RAM: u64 = 0xE000_0000;
+/// The legacy VGA window, which is never RAM.
+pub const VGA_HOLE: std::ops::Range<u64> = devices::vga::WINDOW_BASE..devices::vga::WINDOW_BASE + devices::vga::WINDOW_SIZE;
 
 /// A page-aligned, zero-filled host allocation that can be mapped into a guest.
 pub struct HostBuf {
@@ -90,7 +95,13 @@ impl GuestMemory {
         // alive for the partition's lifetime; the host only touches them while
         // the vCPU is stopped in an exit.
         unsafe {
-            part.map(self.ram.ptr, 0, self.ram.len as u64, Access::ReadWriteExecute)?;
+            part.map(self.ram.ptr, 0, VGA_HOLE.start, Access::ReadWriteExecute)?;
+            part.map(
+                self.ram.ptr.add(VGA_HOLE.end as usize),
+                VGA_HOLE.end,
+                self.ram.len as u64 - VGA_HOLE.end,
+                Access::ReadWriteExecute,
+            )?;
             part.map(self.bios.ptr, BIOS_BASE, BIOS_SIZE as u64, Access::ReadExecute)?;
         }
         Ok(())
@@ -111,7 +122,9 @@ impl GuestMemory {
 
     fn slice(&self, gpa: u64, len: usize) -> Option<(&HostBuf, usize)> {
         let end = gpa.checked_add(len as u64)?;
-        if end <= self.ram.len() as u64 {
+        if gpa < VGA_HOLE.end && end > VGA_HOLE.start {
+            None
+        } else if end <= self.ram.len() as u64 {
             Some((&self.ram, gpa as usize))
         } else if gpa >= BIOS_BASE && end <= 1 << 32 {
             Some((&self.bios, (gpa - BIOS_BASE) as usize))
@@ -132,10 +145,13 @@ impl devices::GuestMemory for GuestMemory {
         }
     }
 
-    /// Writes to the flash are dropped, like writes to a ROM.
+    /// Writes to the flash are dropped, like writes to a ROM. The VGA window
+    /// is not memory.
     fn write(&mut self, gpa: u64, data: &[u8]) -> bool {
         let end = gpa.saturating_add(data.len() as u64);
-        if end <= self.ram.len() as u64 {
+        if gpa < VGA_HOLE.end && end > VGA_HOLE.start {
+            false
+        } else if end <= self.ram.len() as u64 {
             let off = gpa as usize;
             self.ram.as_mut_slice()[off..off + data.len()].copy_from_slice(data);
             true

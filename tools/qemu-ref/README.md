@@ -24,3 +24,19 @@ HPET, SeaBIOS from `payload/`, the ISO on the secondary IDE master) with
 
 `--iso none` traces the BIOS alone, which is a quick way to check the
 tooling works.
+
+## VGA reference runs
+
+`tools/qemu-ref/vga_ref.py` records two short runs that need no ISO:
+`ref/vga-text` (SeaBIOS's text screen) and `ref/vga-gfx` (a boot sector
+that sets mode 12h through VBE and draws with the map mask, as TempleOS
+does). Check the VGA model against them:
+
+```sh
+TEMPLEOS_TRACE=ref/vga-text/trace.log cargo test -p devices replay_vga -- --ignored
+TEMPLEOS_TRACE=ref/vga-gfx/trace.log cargo test -p devices replay_vga -- --ignored
+```
+
+Every read is compared with QEMU's value, and the final frame must equal
+QEMU's last screendump pixel for pixel. Without `TEMPLEOS_TRACE` the test
+uses `ref/boot/trace.log`.

@@ -4,15 +4,20 @@
 //! Interrupt delivery follows QEMU's WHPX backend with the in-hypervisor
 //! local APIC: 8259 interrupts are injected as ExtINT pending events, only
 //! after an interrupt-window exit says the guest can take one.
+//!
+//! Display: every 1/60 s of wall time the run loop renders the VGA into a
+//! [`Frame`] and hands it to the display callback. Rendering happens on the
+//! vCPU thread between runs, so it always sees a consistent VGA state.
 
 // Exit reasons are matched by the windows crate's constant names.
 #![allow(non_upper_case_globals)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use devices::pc::{Pc, PcConfig};
+use devices::vga_render::{Frame, Renderer};
 use devices::Nanos;
 use windows::core::HRESULT;
 use windows::Win32::Foundation::{E_FAIL, S_OK};
@@ -21,7 +26,8 @@ use windows::Win32::System::Hypervisor::*;
 use crate::cpuid::Cpuid;
 use crate::memory::GuestMemory;
 use crate::timer::HrTimer;
-use crate::whpx::{self, Partition};
+use crate::memory::VGA_HOLE;
+use crate::whpx::{self, Access, Partition};
 
 pub struct Config {
     pub ram_size: u64,
@@ -30,7 +36,17 @@ pub struct Config {
     pub cdrom: Option<&'static [u8]>,
     /// Guest wall-clock time at power-on, in Unix seconds.
     pub rtc_base: i64,
+    /// Map a VGA plane straight into the guest while that is exact
+    /// ([`devices::vga::Vga::fast_plane`]). Off means every access to the
+    /// VGA window is emulated.
+    pub vga_fast_path: bool,
 }
+
+/// Receives each rendered frame (see [`Machine::set_display`]).
+pub type DisplayFn = Box<dyn FnMut(&Frame)>;
+
+/// Wall time between rendered frames.
+const FRAME_NS: Nanos = 1_000_000_000 / 60;
 
 /// Points in the boot the run loop recognizes and reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,6 +75,8 @@ pub enum Stop {
     Milestone(Milestone),
     TimeLimit,
     ResetRequested,
+    /// The stop flag was set (e.g. the window was closed).
+    Quit,
 }
 
 #[derive(Debug)]
@@ -93,11 +111,23 @@ pub struct Machine {
     ready_for_pic: bool,
     /// An interrupt-window notification is requested and not yet delivered.
     window_registered: bool,
+    /// The vCPU executed HLT and waits for an interrupt. The flag is RFLAGS.IF
+    /// at the HLT: with interrupts disabled only an NMI (which the board never
+    /// raises) could wake it, so it stays halted.
+    halted: Option<bool>,
     reached: Vec<Milestone>,
     /// Debug console output not yet split into lines.
     debugcon_line: Vec<u8>,
     debugcon_sink: Option<Box<dyn std::io::Write>>,
     echo_debugcon: bool,
+    vga_fast_path: bool,
+    /// The VGA plane currently mapped at 0xA0000, if any.
+    vga_mapped: Option<usize>,
+    renderer: Renderer,
+    frame: Frame,
+    next_frame: Nanos,
+    display: Option<DisplayFn>,
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 const VP: u32 = 0;
@@ -134,10 +164,18 @@ impl Machine {
             timer: HrTimer::new(),
             ready_for_pic: false,
             window_registered: false,
+            halted: None,
             reached: Vec::new(),
             debugcon_line: Vec::new(),
             debugcon_sink: None,
             echo_debugcon: true,
+            vga_fast_path: cfg.vga_fast_path,
+            vga_mapped: None,
+            renderer: Renderer::new(),
+            frame: Frame::default(),
+            next_frame: 0,
+            display: None,
+            stop_flag: None,
         };
         m.reset_vcpu()?;
         Ok(m)
@@ -151,6 +189,30 @@ impl Machine {
 
     pub fn pc_mut(&mut self) -> &mut Pc {
         &mut self.pc
+    }
+
+    /// Log every port and MMIO access (see [`Pc::set_trace`]). Tracing sees
+    /// only emulated accesses, so it turns the VGA fast path off.
+    pub fn set_trace(&mut self, w: Box<dyn std::io::Write + Send>) {
+        self.pc.set_trace(w);
+        self.vga_fast_path = false;
+    }
+
+    /// Call `f` with a freshly rendered frame 60 times a second while running.
+    pub fn set_display(&mut self, f: DisplayFn) {
+        self.display = Some(f);
+    }
+
+    /// [`Machine::run`] returns [`Stop::Quit`] soon after `flag` becomes true.
+    pub fn set_stop_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.stop_flag = Some(flag);
+    }
+
+    /// Render the display as it is now.
+    pub fn render(&mut self) -> &Frame {
+        let now = self.now();
+        self.renderer.render(self.pc.vga(), now, &mut self.frame);
+        &self.frame
     }
 
     pub fn memory(&self) -> &GuestMemory {
@@ -214,10 +276,31 @@ impl Machine {
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(Stop::TimeLimit);
             }
+            if self.stop_flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+                return Ok(Stop::Quit);
+            }
+            if self.display.is_some() && now >= self.next_frame {
+                self.next_frame = now + FRAME_NS;
+                self.renderer.render(self.pc.vga(), now, &mut self.frame);
+                if let Some(show) = &mut self.display {
+                    show(&self.frame);
+                }
+            }
+            let wake = self.next_wake(now);
 
+            if let Some(interrupts_enabled) = self.halted {
+                if !(interrupts_enabled && self.pc.has_interrupt()) {
+                    // HLT with nothing to deliver: sleep until the next timer
+                    // event or frame, then look again.
+                    self.timer.sleep(Duration::from_nanos(wake.saturating_sub(now)));
+                    continue;
+                }
+                self.halted = None;
+            }
+
+            self.update_vga_mapping()?;
             self.inject_interrupts()?;
-            let wake = self.pc.next_deadline().map(|t| t.min(now + 10_000_000));
-            self.kicker.arm(wake.unwrap_or(now + 10_000_000));
+            self.kicker.arm(wake);
             let exit = self.part.run(VP);
             self.kicker.disarm();
             let exit = exit?;
@@ -238,7 +321,7 @@ impl Machine {
                 WHvRunVpExitReasonMemoryAccess => self.emulate_mmio(&exit)?,
                 WHvRunVpExitReasonX64IoPortAccess => self.emulate_io(&exit)?,
                 WHvRunVpExitReasonX64Cpuid => self.cpuid_exit(&exit)?,
-                WHvRunVpExitReasonX64Halt => self.halt(deadline),
+                WHvRunVpExitReasonX64Halt => self.halted = Some(exit.VpContext.Rflags & 0x200 != 0),
                 WHvRunVpExitReasonX64InterruptWindow => {
                     self.ready_for_pic = true;
                     self.window_registered = false;
@@ -320,20 +403,39 @@ impl Machine {
         Ok(())
     }
 
-    /// HLT with nothing to deliver: sleep until a device raises an interrupt.
-    fn halt(&mut self, limit: Option<Instant>) {
-        loop {
-            let now = self.now();
-            self.pc.poll(now);
-            if self.pc.has_interrupt() {
-                return;
-            }
-            if limit.is_some_and(|d| Instant::now() >= d) {
-                return;
-            }
-            let until = self.pc.next_deadline().unwrap_or(now + 10_000_000).min(now + 10_000_000);
-            self.timer.sleep(Duration::from_nanos(until.saturating_sub(now)));
+    /// When the run loop must next look at the machine: the next device
+    /// timer, the next frame, and at most 10 ms from now.
+    fn next_wake(&self, now: Nanos) -> Nanos {
+        let mut wake = now + 10_000_000;
+        if let Some(t) = self.pc.next_deadline() {
+            wake = wake.min(t);
         }
+        if self.display.is_some() {
+            wake = wake.min(self.next_frame);
+        }
+        wake
+    }
+
+    /// Map or unmap a VGA plane at 0xA0000 to follow the VGA's state. Runs
+    /// before every guest entry; the VGA registers only change in exits.
+    fn update_vga_mapping(&mut self) -> Result<()> {
+        let want = if self.vga_fast_path { self.pc.vga_fast_plane() } else { None };
+        if want.map(|(p, _)| p) == self.vga_mapped {
+            return Ok(());
+        }
+        let window = VGA_HOLE.start;
+        let len = 0x10000;
+        if self.vga_mapped.take().is_some() {
+            self.part.unmap(window, len)?;
+        }
+        if let Some((plane, ptr)) = want {
+            // SAFETY: the plane is a page-aligned 4 MiB block owned by the
+            // VGA, which lives as long as the machine; the host only touches
+            // it while the vCPU is stopped.
+            unsafe { self.part.map(ptr, window, len, Access::ReadWrite)? };
+            self.vga_mapped = Some(plane);
+        }
+        Ok(())
     }
 
     fn cpuid_exit(&mut self, exit: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<()> {

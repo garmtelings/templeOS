@@ -207,11 +207,23 @@ Writes to the frame buffer:
   plane, with Map Mask = 1, 2, 4, 8 and the graphics controller left in
   write mode 0 with no rotate or logic op and bit mask 0xFF (SeaVGABIOS
   defaults for mode 12h).
-- A full frame is at most 4 × 4800 qword stores. That's why the plan maps
-  the selected plane's backing memory straight into the guest while the
-  "single plane, write mode 0, plain" state holds. Every access in any other
-  VGA state is emulated exactly, and a 64-bit store must then be split into
-  eight byte-wide VGA writes in address order.
+- A full frame is at most 4 × 4800 qword stores. That's why the VMM maps
+  a plane's backing memory straight into the guest while that is exact
+  (`Vga::fast_plane`: planar addressing, one plane write-enabled, write mode
+  0 with no rotate/logic op/set-reset on that plane, bit mask 0xFF, read mode
+  0 **reading the same plane**). Every access in any other VGA state is
+  emulated exactly, and a 64-bit store is split into eight byte-wide VGA
+  writes in address order, as QEMU's byte-wide `vga-lowmem` region does.
+- **Reads matter.** The kernel never reads VGA memory (`MiniGrLib.HC`: "0xA0000
+  alias memory can't be read"), but `Demo/Lectures/ScrnMemory.HC` plots with
+  `LBts` (a locked read-modify-write) on VGA memory with Map Mask = RED
+  (plane 2) and GR04 = 0: the read returns plane 0, the write goes to plane 2.
+  So TempleOS's frame updates, which leave GR04 at 0, only qualify for the
+  mapping on the plane 0 pass.
+- A mapped plane doesn't reload the latches on reads. That can't matter while
+  the mapping conditions hold (no write mode uses the latches then); it
+  would only be visible if the guest read in that state, switched to a
+  latch-using mode, and wrote before any other read.
 - Text mode (0xB8000) is only used if the VBE call failed, or with the
   `CFG_TEXT_MODE` kernel option.
 

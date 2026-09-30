@@ -1,12 +1,16 @@
 //! TempleOS.exe: boots the embedded, unmodified TempleOS V5.03 ISO in a
 //! purpose-built VMM on the Windows Hypervisor Platform (see PLAN.md).
 //!
-//! Phases 1-2 are headless: the machine runs, reports boot milestones and the
-//! SeaBIOS debug console, and can stop at a milestone.
+//! By default it opens a window showing the VGA display. `--headless` runs
+//! without one: the machine reports boot milestones and the SeaBIOS debug
+//! console, and can stop at a milestone.
+
+mod window;
 
 use std::fs::File;
 use std::io::BufWriter;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vmm::{Config, Machine, Milestone, Stop};
@@ -18,19 +22,28 @@ static ISO: &[u8] = include_bytes!("../payload/TempleOS.ISO");
 const USAGE: &str = "\
 usage: templeos [options]
 
+  --headless          run without a window
+  --fullscreen        start fullscreen (Alt+Enter toggles)
   --mem MIB           guest RAM in MiB (default 1024, minimum 512)
   --until MILESTONE   stop at bios-banner, long-mode or kernel-timers
   --seconds N         stop after N seconds of wall time
   --iso PATH          boot this ISO instead of the embedded one
   --no-cd             boot with no CD in the drive
   --rtc-base UNIX     guest clock at power-on, Unix seconds (default: now)
+  --exact-vga         emulate every VGA memory access (no plane mapping)
+  --screenshot FILE   save the display as a PPM when stopping
   --debugcon FILE     also write the SeaBIOS debug console to FILE
   --trace FILE        log every port/MMIO access in QEMU trace format
+                      (implies --exact-vga)
   --screen            print the VGA text screen when stopping
   --quiet             don't echo the debug console
 ";
 
 struct Args {
+    headless: bool,
+    fullscreen: bool,
+    exact_vga: bool,
+    screenshot: Option<String>,
     mem_mib: u64,
     until: Option<Milestone>,
     seconds: Option<f64>,
@@ -45,6 +58,10 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
+        headless: false,
+        fullscreen: false,
+        exact_vga: false,
+        screenshot: None,
         mem_mib: 1024,
         until: None,
         seconds: None,
@@ -60,6 +77,10 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = it.next() {
         let mut value = || it.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
+            "--headless" => a.headless = true,
+            "--fullscreen" => a.fullscreen = true,
+            "--exact-vga" => a.exact_vga = true,
+            "--screenshot" => a.screenshot = Some(value()?),
             "--mem" => a.mem_mib = value()?.parse().map_err(|_| "bad --mem")?,
             "--until" => {
                 a.until = Some(match value()?.as_str() {
@@ -124,7 +145,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(args) {
+    let result = if args.headless { run_headless(&args) } else { run_windowed(args) };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("templeos: {e}");
@@ -133,12 +155,20 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
+    // Read an --iso file once, however often the guest reboots.
+    static ISO_FILE: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     let cdrom: Option<&'static [u8]> = match (&args.iso, args.no_cd) {
         (_, true) => None,
-        (Some(path), _) => Some(Vec::leak(std::fs::read(path)?)),
+        (Some(path), _) => match ISO_FILE.get() {
+            Some(iso) => Some(*iso),
+            None => Some(*ISO_FILE.get_or_init(|| Vec::leak(std::fs::read(path).unwrap_or_default()))),
+        },
         (None, _) => Some(ISO),
     };
+    if cdrom.is_some_and(|c| c.is_empty()) {
+        return Err(format!("cannot read {}", args.iso.as_deref().unwrap_or_default()).into());
+    }
     let rtc_base = args.rtc_base.unwrap_or_else(|| {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
     });
@@ -148,6 +178,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         vgabios: VGABIOS,
         cdrom,
         rtc_base,
+        vga_fast_path: !args.exact_vga,
     })?;
     if let Some(path) = &args.debugcon {
         m.set_debugcon_sink(Box::new(File::create(path)?), !args.quiet);
@@ -155,18 +186,89 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         m.set_debugcon_sink(Box::new(std::io::sink()), false);
     }
     if let Some(path) = &args.trace {
-        m.pc_mut().set_trace(Box::new(BufWriter::new(File::create(path)?)));
+        m.set_trace(Box::new(BufWriter::new(File::create(path)?)));
     }
+    Ok(m)
+}
 
+/// The normal way to run: a window, with the VM on its own thread. A guest
+/// reboot restarts the machine; closing the window stops it.
+fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    hide_console_if_ours();
+    let shared = window::Shared::new();
+    let vm_shared = shared.clone();
+    let mut vm_thread = None;
+    let started = window::run(shared.clone(), args.fullscreen, || {
+        vm_thread = Some(
+            std::thread::Builder::new()
+                .name("vcpu".into())
+                .spawn(move || {
+                    let error = vm_thread_main(&args, &vm_shared).err().map(|e| e.to_string());
+                    vm_shared.vm_exited(error);
+                })
+                .expect("spawn VM thread"),
+        );
+    });
+    shared.stop.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(t) = vm_thread {
+        let _ = t.join();
+    }
+    started.map_err(|e| {
+        window::error_box(&e);
+        e.into()
+    })
+}
+
+fn vm_thread_main(args: &Args, shared: &Arc<window::Shared>) -> Result<(), Box<dyn std::error::Error>> {
+    let limit = args.seconds.map(Duration::from_secs_f64);
+    loop {
+        let mut m = machine(args)?;
+        let s = shared.clone();
+        m.set_display(Box::new(move |frame| s.present(frame)));
+        m.set_stop_flag(shared.stop.clone());
+        let stop = m.run(args.until, limit)?;
+        if let Some(path) = &args.screenshot {
+            std::fs::write(path, m.render().to_ppm())?;
+        }
+        match stop {
+            Stop::ResetRequested => println!("[vmm] guest reset: rebooting"),
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Started by double-click, the console window is ours alone: close it so
+/// only the TempleOS window shows. From a terminal it stays for the logs.
+fn hide_console_if_ours() {
+    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut pids = [0u32; 2];
+    // SAFETY: the buffer is valid for its length.
+    unsafe {
+        if GetConsoleProcessList(&mut pids) == 1 {
+            let _ = FreeConsole();
+        }
+    }
+}
+
+fn run_headless(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mut m = machine(args)?;
     let limit = args.seconds.map(Duration::from_secs_f64);
     let stop = m.run(args.until, limit)?;
     match stop {
         Stop::Milestone(ms) => println!("[vmm] stopped at milestone: {}", ms.describe()),
         Stop::TimeLimit => println!("[vmm] stopped: time limit"),
         Stop::ResetRequested => println!("[vmm] stopped: guest requested a reset"),
+        Stop::Quit => println!("[vmm] stopped"),
+    }
+    if let Some(path) = &args.screenshot {
+        std::fs::write(path, m.render().to_ppm())?;
+        println!("[vmm] screenshot written to {path}");
     }
     if args.screen {
-        print_text_screen(m.memory().ram());
+        println!("[vmm] text screen:");
+        for line in devices::vga_render::text_screen(m.pc_mut().vga()) {
+            println!("  |{line}|");
+        }
     }
     let unhandled = devices::unhandled_report();
     if !unhandled.is_empty() {
@@ -176,21 +278,4 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
-}
-
-/// The 80x25 text screen at 0xB8000 (what SeaBIOS and the TempleOS boot
-/// loader print before the kernel switches to graphics).
-fn print_text_screen(ram: &[u8]) {
-    let screen = &ram[0xB8000..0xB8000 + 80 * 25 * 2];
-    println!("[vmm] text screen:");
-    for row in screen.chunks(160) {
-        let line: String = row
-            .chunks(2)
-            .map(|c| match c[0] {
-                0x20..=0x7E => c[0] as char,
-                _ => ' ',
-            })
-            .collect();
-        println!("  |{}|", line.trim_end());
-    }
 }

@@ -77,18 +77,30 @@ during development. Nothing gets silently ignored.
 
 TempleOS writes planar VGA memory with map-mask plane selection, so every
 write to 0xA0000 would cause a VM exit: up to ~19k 64-bit stores per frame at
-29.97 frames/s, each split into 8 byte writes. The fix below
-doesn't change any guest-visible behavior:
+29.97 frames/s, each split into 8 byte writes. The fast path must not change
+anything the guest can see:
 
-- Watch the sequencer map-mask and graphics-controller mode registers
-  (port exits, which are cheap and rare).
-- When the state is "write mode 0, a single plane enabled, no rotate or
-  logic op", which is how TempleOS writes a frame, **remap the 0xA0000 guest
-  window straight onto that plane's backing pages** with
-  `WHvMapGpaRange`. Guest writes then go to plain RAM with no exits.
-- In any other VGA state, fall back to exact MMIO emulation of every access.
-- The frontend reads the 4 plane buffers + DAC palette, converts to RGBA and
-  presents at 60 Hz.
+- The VGA memory model keeps each plane contiguous and page aligned, so the
+  VMM can map one plane read-write at 0xA0000-0xAFFFF with `WHvMapGpaRange`.
+  Guest accesses then go to memory with no exits.
+- It does so only while that is exact for reads *and* writes
+  (`Vga::fast_plane`): planar addressing, exactly one plane write-enabled,
+  write mode 0 with no rotate, logic op or set/reset and bit mask 0xFF, and
+  read mode 0 with **the same plane selected for reads** (GR04). The mapping
+  follows the VGA state before every guest entry. `--exact-vga` turns it off.
+- Measured against TempleOS's code, the read-plane condition matters: its
+  `ScrnMemory` demo does read-modify-write (`LBts`) on VGA memory with only
+  plane 2 enabled and GR04 = 0, so a mapping that ignored GR04 would draw
+  differently from real hardware. TempleOS leaves GR04 at 0, so of its four
+  plane passes per frame only plane 0's is accelerated; planes 1-3 are
+  emulated. Whether that's fast enough is for Phase 3 testing on real
+  hardware to show.
+- The one guest-visible difference: a read through the mapping doesn't
+  reload the latches. While the fast-path conditions hold nothing uses the
+  latches; it would only show if the guest read in that state, switched to a
+  latch-using write mode, and wrote before reading again.
+- The VM thread renders the planes and DAC to RGB 60 times a second, between
+  vCPU runs.
 
 ## Single-binary packaging
 
@@ -178,9 +190,34 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   - IDE commands complete instantly, so the guest never sees BSY.
 
 ### Phase 3 — Pixels
-- VGA: full register file, planar memory, DAC, and the fast-path remap above.
-- Win32 window with integer-scaled 640×480 and aspect-correct fullscreen.
-- **Milestone: the TempleOS desktop renders.**
+- [x] VGA memory model (`devices/src/vga.rs`): QEMU's `vga_mem_readb/writeb`,
+  i.e. all four write modes, both read modes, latches, rotate/logic ops,
+  set/reset, bit mask, chain 4, odd/even and the four memory map modes. VRAM
+  is stored planar so a plane can be mapped (see VGA performance above).
+- [x] Renderer (`devices/src/vga_render.rs`), following QEMU's
+  `vga_draw_text`/`vga_draw_graphic`: text modes (8/9/16-dot cells, two
+  fonts, blinking cursor), 16-colour planar, CGA 4-colour, chain-4 256-colour
+  and VBE 8/15/16/24/32 bpp, blanking. Frames can be saved as PPM in QEMU
+  `screendump` format (`--screenshot`).
+- [x] Checked against QEMU: `tools/qemu-ref/vga_ref.py` records a SeaBIOS text
+  screen and a mode 12h boot sector that draws like TempleOS (VBE 4F02h,
+  map-mask writes, a DAC change). Replaying each trace into the model gives
+  zero mismatching reads (38,558 and 116,777 writes), and the rendered frame
+  equals QEMU's screendump pixel for pixel
+  (`cargo test -p devices replay_vga -- --ignored`; the same test runs on
+  `ref/boot/trace.log` by default).
+- [x] Board and VMM: 0xA0000-0xBFFFF is now the VGA window (RAM is mapped
+  around it); byte-wise emulation traced as QEMU's `vga-lowmem`; the fast-path
+  plane mapping; frames at 60 Hz; HLT is a halted state (stays halted with
+  IF=0), so the display keeps updating while the guest idles.
+- [x] Win32 window (`src/window.rs`): whole-number scaling in a window,
+  borderless fullscreen with Alt+Enter (4:3 for VGA modes, square pixels for
+  VBE), per-monitor DPI aware. The VM runs on its own thread; a guest reboot
+  restarts the machine; closing the window stops it. Started by double-click,
+  the console window closes itself. `--headless` keeps the Phase 1-2 CLI.
+- **Milestone: the TempleOS desktop renders.** Not yet confirmed: needs a run
+  on Windows with the ISO. `--exact-vga` vs default is the first A/B to try
+  if anything looks wrong.
 
 ### Phase 4 — Input and sound
 - PS/2 keyboard (scan code set 1, which is what TempleOS reads) and PS/2

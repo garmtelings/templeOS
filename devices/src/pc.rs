@@ -323,9 +323,20 @@ impl Pc {
     // ---- MMIO ----------------------------------------------------------------
 
     pub fn mmio_read(&mut self, gpa: u64, size: u8, now: Nanos) -> u64 {
+        if let Some(off) = vga_window(gpa) {
+            // QEMU's vga-lowmem region is byte-wide: wider accesses are split
+            // into byte accesses in address order (and traced that way).
+            let mut val = 0u64;
+            for i in 0..u32::from(size.min(8)) {
+                let b = self.vga.mem_read(off + i);
+                self.trace(false, gpa + u64::from(i), b.into(), 1, "vga-lowmem");
+                val |= u64::from(b) << (8 * i);
+            }
+            return val;
+        }
         let (val, name) = match self.mmio_target(gpa) {
             Mmio::Hpet(off) => (self.hpet.read(off, size, now), "hpet"),
-            Mmio::VgaLfb(off) => (le_read(self.vga.vram(), off, size), "vga.vram"),
+            Mmio::VgaLfb(off) => (self.vga.lfb_read(off, size), "vga.vram"),
             Mmio::VgaBar2(off) => (self.vga.bar2_read(off, size), "vga.mmio"),
             Mmio::VgaRom(off) => (le_read(self.vga.rom(), off, size), "vga.rom"),
             Mmio::None => {
@@ -339,13 +350,21 @@ impl Pc {
     }
 
     pub fn mmio_write(&mut self, gpa: u64, size: u8, val: u64, now: Nanos) {
+        if let Some(off) = vga_window(gpa) {
+            for i in 0..u32::from(size.min(8)) {
+                let b = (val >> (8 * i)) as u8;
+                self.vga.mem_write(off + i, b);
+                self.trace(true, gpa + u64::from(i), b.into(), 1, "vga-lowmem");
+            }
+            return;
+        }
         let name = match self.mmio_target(gpa) {
             Mmio::Hpet(off) => {
                 self.hpet.write(off, size, val, now);
                 "hpet"
             }
             Mmio::VgaLfb(off) => {
-                le_write(self.vga.vram_mut(), off, size, val);
+                self.vga.lfb_write(off, size, val);
                 "vga.vram"
             }
             Mmio::VgaBar2(off) => {
@@ -445,6 +464,12 @@ impl Pc {
         &self.vga
     }
 
+    /// The VGA plane the VMM may map at 0xA0000-0xAFFFF instead of emulating
+    /// accesses (see [`Vga::fast_plane`]), and its page-aligned host address.
+    pub fn vga_fast_plane(&self) -> Option<(usize, *mut u8)> {
+        self.vga.fast_plane().map(|p| (p, self.vga.vram().plane_host_ptr(p)))
+    }
+
     pub fn ps2_mut(&mut self) -> &mut Ps2 {
         &mut self.ps2
     }
@@ -456,6 +481,12 @@ enum Mmio {
     VgaBar2(u32),
     VgaRom(u32),
     None,
+}
+
+/// Offset into the VGA memory window, if `gpa` is in 0xA0000-0xBFFFF.
+fn vga_window(gpa: u64) -> Option<u32> {
+    let base = crate::vga::WINDOW_BASE;
+    (base..base + crate::vga::WINDOW_SIZE).contains(&gpa).then(|| (gpa - base) as u32)
 }
 
 fn ide_channel(port: u16) -> Option<usize> {
@@ -492,14 +523,6 @@ fn le_read(buf: &[u8], off: u32, size: u8) -> u64 {
         v |= (*buf.get(off as usize + i).unwrap_or(&0xFF) as u64) << (8 * i);
     }
     v
-}
-
-fn le_write(buf: &mut [u8], off: u32, size: u8, val: u64) {
-    for i in 0..size as usize {
-        if let Some(b) = buf.get_mut(off as usize + i) {
-            *b = (val >> (8 * i)) as u8;
-        }
-    }
 }
 
 /// fw_cfg as QEMU's pc machine provides it (FwCfg::new adds the entries

@@ -55,6 +55,7 @@ pub fn hypervisor_present() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
     ReadWriteExecute,
+    ReadWrite,
     ReadExecute,
 }
 
@@ -64,6 +65,9 @@ impl Access {
             Access::ReadWriteExecute => WHV_MAP_GPA_RANGE_FLAGS(
                 WHvMapGpaRangeFlagRead.0 | WHvMapGpaRangeFlagWrite.0 | WHvMapGpaRangeFlagExecute.0,
             ),
+            Access::ReadWrite => {
+                WHV_MAP_GPA_RANGE_FLAGS(WHvMapGpaRangeFlagRead.0 | WHvMapGpaRangeFlagWrite.0)
+            }
             Access::ReadExecute => {
                 WHV_MAP_GPA_RANGE_FLAGS(WHvMapGpaRangeFlagRead.0 | WHvMapGpaRangeFlagExecute.0)
             }

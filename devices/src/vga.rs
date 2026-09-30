@@ -4,14 +4,131 @@
 //! extended registers), the option ROM and the 16 MiB VRAM.
 //!
 //! Register semantics follow QEMU 8.2 `hw/display/vga.c` (`vga_ioport_read`,
-//! `vga_ioport_write`, `vbe_ioport_*`) and `hw/display/vga-pci.c`.
-//! Planar memory access through 0xA0000 and rendering are not modelled here
-//! yet (Phase 3); everything they need is in [`VgaRegs`] and [`Vga::vram`].
+//! `vga_ioport_write`, `vbe_ioport_*`, `vga_mem_readb`, `vga_mem_writeb`) and
+//! `hw/display/vga-pci.c`. The renderer is in [`crate::vga_render`].
+//!
+//! Video memory is stored planar (see [`Vram`]) rather than interleaved as in
+//! QEMU. Every access translates, so what the guest sees is the same, but a
+//! plane is one contiguous, page-aligned block the VMM can map straight into
+//! the guest while the VGA is in a state where that is exact
+//! ([`Vga::fast_plane`]).
+
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ptr::NonNull;
 
 use crate::unhandled;
 
 /// Size of the video memory (QEMU's default `vgamem_mb=16`).
 pub const VRAM_SIZE: usize = 16 << 20;
+/// Bytes per plane: a quarter of VRAM, as QEMU's latched accesses see it.
+pub const PLANE_SIZE: usize = VRAM_SIZE / 4;
+
+/// The legacy VGA memory window at 0xA0000-0xBFFFF.
+pub const WINDOW_BASE: u64 = 0xA0000;
+pub const WINDOW_SIZE: u64 = 0x20000;
+
+/// `mask16[i]`: 0xFF in byte p of the result for each bit p set in `i`.
+fn mask16(i: u8) -> u32 {
+    (0..4).filter(|p| i & (1 << p) != 0).map(|p| 0xffu32 << (p * 8)).sum()
+}
+
+/// Video memory in planar layout: plane p is the `PLANE_SIZE` bytes at
+/// `p * PLANE_SIZE`. QEMU's interleaved byte `4 * o + p` is plane p, offset o
+/// here; [`Vram::get`] and [`Vram::set`] take QEMU's (interleaved) index.
+///
+/// The allocation is page aligned so the VMM can map a plane into the guest.
+/// While it is mapped the guest writes it behind Rust's back, so this type
+/// never hands out long-lived references: all access is through methods that
+/// the VMM only calls while the vCPU is stopped.
+pub struct Vram {
+    ptr: NonNull<u8>,
+}
+
+// SAFETY: Vram owns its allocation; access is synchronized by its owner.
+unsafe impl Send for Vram {}
+
+impl Vram {
+    fn layout() -> Layout {
+        Layout::from_size_align(VRAM_SIZE, 4096).expect("VRAM layout")
+    }
+
+    pub fn new() -> Self {
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { alloc_zeroed(Self::layout()) };
+        Vram { ptr: NonNull::new(ptr).expect("out of memory allocating VRAM") }
+    }
+
+    /// Byte `i` in QEMU's interleaved numbering. Out of range reads 0.
+    pub fn get(&self, i: usize) -> u8 {
+        if i >= VRAM_SIZE {
+            return 0;
+        }
+        self.plane(i & 3)[i >> 2]
+    }
+
+    /// Set byte `i` in QEMU's interleaved numbering. Out of range is dropped.
+    pub fn set(&mut self, i: usize, v: u8) {
+        if i < VRAM_SIZE {
+            self.plane_mut(i & 3)[i >> 2] = v;
+        }
+    }
+
+    /// The four plane bytes at `offset`, plane 0 in the low byte (QEMU's
+    /// `((uint32_t *)vram_ptr)[offset]` on a little-endian host).
+    pub fn latch_at(&self, offset: usize) -> u32 {
+        (0..4).map(|p| u32::from(self.plane(p)[offset]) << (p * 8)).sum()
+    }
+
+    fn store_latched(&mut self, offset: usize, val: u32, write_mask: u32) {
+        for p in 0..4 {
+            if write_mask >> (p * 8) & 0xff != 0 {
+                self.plane_mut(p)[offset] = (val >> (p * 8)) as u8;
+            }
+        }
+    }
+
+    pub fn plane(&self, p: usize) -> &[u8] {
+        assert!(p < 4);
+        // SAFETY: plane p lies inside the allocation.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(p * PLANE_SIZE), PLANE_SIZE) }
+    }
+
+    pub fn plane_mut(&mut self, p: usize) -> &mut [u8] {
+        assert!(p < 4);
+        // SAFETY: as in plane, and &mut self gives exclusive host access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(p * PLANE_SIZE), PLANE_SIZE) }
+    }
+
+    /// Host address of plane `p`, page aligned, for mapping into the guest.
+    pub fn plane_host_ptr(&self, p: usize) -> *mut u8 {
+        assert!(p < 4);
+        // SAFETY: in bounds of the allocation.
+        unsafe { self.ptr.as_ptr().add(p * PLANE_SIZE) }
+    }
+
+    /// Zero interleaved bytes `0..len`.
+    fn clear(&mut self, len: usize) {
+        let len = len.min(VRAM_SIZE);
+        for p in 0..4 {
+            // Offsets o with 4 * o + p < len.
+            let n = (len + 3 - p) / 4;
+            self.plane_mut(p)[..n].fill(0);
+        }
+    }
+}
+
+impl Default for Vram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Vram {
+    fn drop(&mut self) {
+        // SAFETY: allocated in new with the same layout.
+        unsafe { dealloc(self.ptr.as_ptr(), Self::layout()) }
+    }
+}
 
 /// The EDID blob QEMU's std VGA exposes at BAR 2 offset 0 (captured from the
 /// reference machine, docs/ref/edid-stdvga.txt).
@@ -89,6 +206,18 @@ const SR_PLANE_WRITE: usize = 0x02;
 const SR_CLOCK_MODE: usize = 0x01;
 const SR_MEMORY_MODE: usize = 0x04;
 
+const GR_SR_VALUE: usize = 0x00;
+const GR_SR_ENABLE: usize = 0x01;
+const GR_COMPARE_VALUE: usize = 0x02;
+const GR_DATA_ROTATE: usize = 0x03;
+const GR_PLANE_READ: usize = 0x04;
+const GR_COMPARE_MASK: usize = 0x07;
+const GR_BIT_MASK: usize = 0x08;
+/// SR04 bit 2: 0 = odd/even addressing (QEMU `VGA_SR04_SEQ_MODE`).
+const SR04_SEQ_MODE: u8 = 0x04;
+/// SR04 bit 3: chain 4 (QEMU `VGA_SR04_CHN_4M`).
+const SR04_CHN_4M: u8 = 0x08;
+
 /// Input status 1 bits QEMU's "dumb" retrace toggles on every read.
 const ST01_V_RETRACE: u8 = 0x08;
 const ST01_DISP_ENABLE: u8 = 0x01;
@@ -142,6 +271,9 @@ pub struct VgaRegs {
     pub bank_offset: u32,
     /// Framebuffer byte order selected through the QEMU extended registers.
     pub big_endian_fb: bool,
+    /// The four plane latches, plane 0 in the low byte, loaded by every
+    /// latched (planar) read.
+    pub latch: u32,
 }
 
 impl Default for VgaRegs {
@@ -178,6 +310,7 @@ impl Default for VgaRegs {
             vbe_start_addr: 0,
             bank_offset: 0,
             big_endian_fb: false,
+            latch: 0,
         }
     }
 }
@@ -206,7 +339,7 @@ impl VgaRegs {
 /// The std VGA device.
 pub struct Vga {
     regs: VgaRegs,
-    vram: Vec<u8>,
+    vram: Vram,
     rom: Vec<u8>,
 }
 
@@ -225,7 +358,7 @@ impl Vga {
         padded[..rom.len()].copy_from_slice(rom);
         Self {
             regs: VgaRegs::default(),
-            vram: vec![0; VRAM_SIZE],
+            vram: Vram::new(),
             rom: padded,
         }
     }
@@ -240,12 +373,24 @@ impl Vga {
         &self.rom
     }
 
-    pub fn vram(&self) -> &[u8] {
+    pub fn vram(&self) -> &Vram {
         &self.vram
     }
 
-    pub fn vram_mut(&mut self) -> &mut [u8] {
+    pub fn vram_mut(&mut self) -> &mut Vram {
         &mut self.vram
+    }
+
+    /// Read from the linear framebuffer (PCI BAR 0), little endian.
+    pub fn lfb_read(&self, off: u32, size: u8) -> u64 {
+        (0..u64::from(size)).map(|i| u64::from(self.vram.get(off as usize + i as usize)) << (i * 8)).sum()
+    }
+
+    /// Write to the linear framebuffer (PCI BAR 0), little endian.
+    pub fn lfb_write(&mut self, off: u32, size: u8, val: u64) {
+        for i in 0..usize::from(size) {
+            self.vram.set(off as usize + i, (val >> (i * 8)) as u8);
+        }
     }
 
     /// True for the ports QEMU registers on the ISA bus (0x3B4/5, 0x3BA,
@@ -497,7 +642,7 @@ impl Vga {
                     if val & dispi::NOCLEARMEM == 0 {
                         let len = usize::from(self.regs.vbe_regs[dispi::INDEX_YRES as usize])
                             * self.regs.vbe_line_offset as usize;
-                        self.vram[..len.min(VRAM_SIZE)].fill(0);
+                        self.vram.clear(len);
                     }
                 } else {
                     self.regs.bank_offset = 0;
@@ -597,6 +742,150 @@ impl Vga {
         };
         r.gr[GR_MODE] = (r.gr[GR_MODE] & !0x60) | (shift_control << 5);
         r.cr[CR_MAX_SCAN] &= !0x9f;
+    }
+
+    /// Translate an offset into the 0xA0000 window (QEMU's "convert to VGA
+    /// memory offset"): None when the memory map mode leaves it unmapped.
+    fn window_offset(&self, addr: u32) -> Option<usize> {
+        let addr = addr & 0x1ffff;
+        match (self.regs.gr[GR_MISC] >> 2) & 3 {
+            0 => Some(addr as usize),
+            1 => (addr < 0x10000).then(|| (addr + self.regs.bank_offset) as usize),
+            2 => addr.checked_sub(0x10000).filter(|&a| a < 0x8000).map(|a| a as usize),
+            _ => addr.checked_sub(0x18000).filter(|&a| a < 0x8000).map(|a| a as usize),
+        }
+    }
+
+    /// Byte read at `addr` (offset from 0xA0000): QEMU `vga_mem_readb`.
+    pub fn mem_read(&mut self, addr: u32) -> u8 {
+        let Some(addr) = self.window_offset(addr) else {
+            return 0xff;
+        };
+        let sr4 = self.regs.effective_sr(SR_MEMORY_MODE);
+        if sr4 & SR04_CHN_4M != 0 {
+            self.vram.get(addr)
+        } else if sr4 & SR04_SEQ_MODE == 0 {
+            // Odd/even (text mode addressing).
+            let plane = (self.regs.gr[GR_PLANE_READ] & 2) as usize | (addr & 1);
+            let index = ((addr & !1) << 1) | plane;
+            if index >= VRAM_SIZE {
+                return 0xff;
+            }
+            self.vram.get(index)
+        } else {
+            if addr >= PLANE_SIZE {
+                return 0xff;
+            }
+            let latch = self.vram.latch_at(addr);
+            self.regs.latch = latch;
+            let r = &self.regs;
+            if r.gr[GR_MODE] & 0x08 == 0 {
+                // Read mode 0: the byte of the selected plane.
+                (latch >> ((r.gr[GR_PLANE_READ] & 3) * 8)) as u8
+            } else {
+                // Read mode 1: colour compare.
+                let mut v = (latch ^ mask16(r.gr[GR_COMPARE_VALUE])) & mask16(r.gr[GR_COMPARE_MASK]);
+                v |= v >> 16;
+                v |= v >> 8;
+                !(v as u8)
+            }
+        }
+    }
+
+    /// Byte write at `addr` (offset from 0xA0000): QEMU `vga_mem_writeb`.
+    pub fn mem_write(&mut self, addr: u32, val: u8) {
+        let Some(addr) = self.window_offset(addr) else {
+            return;
+        };
+        let sr4 = self.regs.effective_sr(SR_MEMORY_MODE);
+        let plane_write = self.regs.effective_sr(SR_PLANE_WRITE);
+        if sr4 & SR04_CHN_4M != 0 {
+            if plane_write & (1 << (addr & 3)) != 0 {
+                self.vram.set(addr, val);
+            }
+            return;
+        }
+        if sr4 & SR04_SEQ_MODE == 0 {
+            let plane = (self.regs.gr[GR_PLANE_READ] & 2) as usize | (addr & 1);
+            if plane_write & (1 << plane) != 0 {
+                let index = ((addr & !1) << 1) | plane;
+                if index < VRAM_SIZE {
+                    self.vram.set(index, val);
+                }
+            }
+            return;
+        }
+
+        // Standard latched access.
+        let r = &self.regs;
+        let latch = r.latch;
+        let rotate = |v: u8| v.rotate_right(u32::from(r.gr[GR_DATA_ROTATE] & 7));
+        let replicate = |v: u8| u32::from(v) * 0x0101_0101;
+        let (val, bit_mask) = match r.gr[GR_MODE] & 3 {
+            0 => {
+                let v = replicate(rotate(val));
+                let set_mask = mask16(r.gr[GR_SR_ENABLE]);
+                ((v & !set_mask) | (mask16(r.gr[GR_SR_VALUE]) & set_mask), r.gr[GR_BIT_MASK])
+            }
+            1 => {
+                self.store(addr, latch);
+                return;
+            }
+            2 => (mask16(val & 0x0f), r.gr[GR_BIT_MASK]),
+            _ => (mask16(r.gr[GR_SR_VALUE]), r.gr[GR_BIT_MASK] & rotate(val)),
+        };
+        let val = match r.gr[GR_DATA_ROTATE] >> 3 {
+            1 => val & latch,
+            2 => val | latch,
+            3 => val ^ latch,
+            _ => val,
+        };
+        let bit_mask = replicate(bit_mask);
+        self.store(addr, (val & bit_mask) | (latch & !bit_mask));
+    }
+
+    /// Store four plane bytes at `offset`, through the sequencer map mask.
+    fn store(&mut self, offset: usize, val: u32) {
+        if offset >= PLANE_SIZE {
+            return;
+        }
+        let write_mask = mask16(self.regs.effective_sr(SR_PLANE_WRITE));
+        self.vram.store_latched(offset, val, write_mask);
+    }
+
+    /// The plane the VMM may map read-write at 0xA0000-0xAFFFF in place of
+    /// emulating each access, or None when that would not be exact.
+    ///
+    /// Mapping plane p is exact for every byte access when the window is
+    /// 0xA0000-0xAFFFF with no bank offset, addressing is planar (no chain 4,
+    /// no odd/even), only plane p is write enabled, and a write stores the
+    /// CPU byte unchanged (write mode 0, no rotate, no logic op, no
+    /// set/reset on p, bit mask 0xFF), while a read returns plane p's byte
+    /// (read mode 0 with plane p selected).
+    ///
+    /// The one thing a mapping can't do is reload the latches on a read.
+    /// While these conditions hold the latches don't affect anything; they
+    /// only matter if the guest later switches to a latch-using write mode
+    /// and writes before reading again. See docs/hw-surface.md §5.
+    pub fn fast_plane(&self) -> Option<usize> {
+        let r = &self.regs;
+        let sr4 = r.effective_sr(SR_MEMORY_MODE);
+        let plane = match r.effective_sr(SR_PLANE_WRITE) & 0x0f {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => return None,
+        };
+        let exact = sr4 & (SR04_CHN_4M | SR04_SEQ_MODE) == SR04_SEQ_MODE
+            && (r.gr[GR_MISC] >> 2) & 3 == 1
+            && r.bank_offset == 0
+            && r.gr[GR_MODE] & 0x0b == 0
+            && r.gr[GR_DATA_ROTATE] == 0
+            && r.gr[GR_SR_ENABLE] & (1 << plane) == 0
+            && r.gr[GR_BIT_MASK] == 0xff
+            && usize::from(r.gr[GR_PLANE_READ] & 3) == plane;
+        exact.then_some(plane)
     }
 
     /// Read from the 4 KiB BAR 2 MMIO window. Accesses QEMU would reject
@@ -888,8 +1177,8 @@ mod tests {
     #[test]
     fn dispi_mode_set() {
         let mut v = vga();
-        v.vram_mut()[0] = 0xaa;
-        v.vram_mut()[640 * 4 * 480] = 0xbb;
+        v.vram_mut().set(0, 0xaa);
+        v.vram_mut().set(640 * 4 * 480, 0xbb);
         let set = |v: &mut Vga, i: u16, val: u16| {
             v.dispi_write(0x1ce, i);
             v.dispi_write(0x1cf, val);
@@ -909,8 +1198,9 @@ mod tests {
         assert_eq!(get(&mut v, dispi::INDEX_VIRT_WIDTH), 640);
         assert_eq!(get(&mut v, dispi::INDEX_VIRT_HEIGHT), (VRAM_SIZE / (640 * 4)) as u16);
         assert_eq!(v.regs().vbe_line_offset, 2560);
-        assert_eq!(v.vram()[0], 0, "enable clears VRAM");
-        assert_eq!(v.vram()[640 * 4 * 480], 0xbb, "only yres * line_offset");
+        assert_eq!(v.vram().get(0), 0, "enable clears VRAM");
+        assert_eq!(v.vram().get(640 * 4 * 480 - 1), 0);
+        assert_eq!(v.vram().get(640 * 4 * 480), 0xbb, "only yres * line_offset");
         // Forced VGA registers.
         v.io_write(0x3ce, 0x06);
         assert_eq!(v.io_read(0x3cf) & 0x0d, 0x05);
@@ -925,9 +1215,9 @@ mod tests {
         assert_eq!(v.regs().bank_offset, 0xff << 16);
 
         set(&mut v, dispi::INDEX_ENABLE, 0);
-        v.vram_mut()[0] = 0xcc;
+        v.vram_mut().set(0, 0xcc);
         set(&mut v, dispi::INDEX_ENABLE, dispi::ENABLED | dispi::NOCLEARMEM | dispi::DAC_8BIT);
-        assert_eq!(v.vram()[0], 0xcc);
+        assert_eq!(v.vram().get(0), 0xcc);
         assert!(v.regs().dac_8bit);
     }
 
@@ -990,6 +1280,237 @@ mod tests {
         assert_eq!(v.bar2_read(0x700, 4), 0);
     }
 
+    fn seq(v: &mut Vga, i: u8, val: u8) {
+        v.io_write(0x3c4, i);
+        v.io_write(0x3c5, val);
+    }
+
+    fn gc(v: &mut Vga, i: u8, val: u8) {
+        v.io_write(0x3ce, i);
+        v.io_write(0x3cf, val);
+    }
+
+    /// The memory-related registers as SeaVGABIOS leaves them for mode 12h.
+    fn mode12(v: &mut Vga) {
+        v.io_write(0x3c2, 0xe3);
+        seq(v, 0x02, 0x0f);
+        seq(v, 0x04, 0x06);
+        for (i, val) in [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0x05), (7, 0x0f), (8, 0xff)] {
+            gc(v, i, val);
+        }
+    }
+
+    #[test]
+    fn planar_write_mode0_and_map_mask() {
+        let mut v = vga();
+        mode12(&mut v);
+        v.mem_write(0x10, 0xa5);
+        for p in 0..4 {
+            assert_eq!(v.vram().plane(p)[0x10], 0xa5);
+        }
+        seq(&mut v, 0x02, 0x04);
+        v.mem_write(0x10, 0x3c);
+        assert_eq!(v.vram().plane(2)[0x10], 0x3c);
+        assert_eq!(v.vram().plane(0)[0x10], 0xa5);
+        // Read mode 0 returns the plane chosen by GR04.
+        gc(&mut v, 4, 2);
+        assert_eq!(v.mem_read(0x10), 0x3c);
+        gc(&mut v, 4, 1);
+        assert_eq!(v.mem_read(0x10), 0xa5);
+        // QEMU's interleaved numbering: plane p offset o is byte 4 * o + p.
+        assert_eq!(v.vram().get(4 * 0x10 + 2), 0x3c);
+        assert_eq!(v.lfb_read(4 * 0x10, 4), 0xa53ca5a5);
+    }
+
+    #[test]
+    fn latches_and_write_mode1_copy() {
+        let mut v = vga();
+        mode12(&mut v);
+        for p in 0..4u8 {
+            seq(&mut v, 0x02, 1 << p);
+            v.mem_write(0x100, 0x10 + p);
+        }
+        seq(&mut v, 0x02, 0x0f);
+        v.mem_read(0x100);
+        assert_eq!(v.regs().latch, 0x1312_1110);
+        gc(&mut v, 5, 0x01);
+        v.mem_write(0x200, 0xff); // CPU data ignored in write mode 1
+        for p in 0..4 {
+            assert_eq!(v.vram().plane(p)[0x200], 0x10 + p as u8);
+        }
+    }
+
+    #[test]
+    fn write_mode0_set_reset_rotate_logic_and_bit_mask() {
+        let mut v = vga();
+        mode12(&mut v);
+        v.mem_write(0, 0xf0);
+        v.mem_read(0); // latches = f0 in every plane
+        // Set/reset: planes 0 and 2 get 0xFF, 1 and 3 get CPU data.
+        gc(&mut v, 0, 0x05);
+        gc(&mut v, 1, 0x05);
+        v.mem_write(1, 0x0f);
+        let got: Vec<u8> = (0..4).map(|p| v.vram().plane(p)[1]).collect();
+        assert_eq!(got, [0xff, 0x0f, 0xff, 0x0f]);
+        gc(&mut v, 1, 0);
+        // Rotate right by 4, then XOR with the latches.
+        gc(&mut v, 3, (3 << 3) | 4);
+        v.mem_write(2, 0x0f);
+        assert_eq!(v.vram().plane(0)[2], 0xf0 ^ 0xf0);
+        // AND, OR.
+        gc(&mut v, 3, 1 << 3);
+        v.mem_write(3, 0x3c);
+        assert_eq!(v.vram().plane(3)[3], 0x30);
+        gc(&mut v, 3, 2 << 3);
+        v.mem_write(4, 0x03);
+        assert_eq!(v.vram().plane(1)[4], 0xf3);
+        // Bit mask keeps latch bits outside the mask.
+        gc(&mut v, 3, 0);
+        gc(&mut v, 8, 0x0f);
+        v.mem_write(5, 0x00);
+        assert_eq!(v.vram().plane(0)[5], 0xf0);
+    }
+
+    #[test]
+    fn write_modes_2_and_3() {
+        let mut v = vga();
+        mode12(&mut v);
+        v.mem_read(0); // latches = 0
+        gc(&mut v, 5, 0x02);
+        gc(&mut v, 8, 0xc0);
+        v.mem_write(0, 0x0a); // colour 1010b: planes 1 and 3
+        let got: Vec<u8> = (0..4).map(|p| v.vram().plane(p)[0]).collect();
+        assert_eq!(got, [0x00, 0xc0, 0x00, 0xc0]);
+
+        gc(&mut v, 5, 0x03);
+        gc(&mut v, 0, 0x06); // set/reset colour 0110b
+        gc(&mut v, 8, 0xf0);
+        gc(&mut v, 3, 0x01); // rotate right by 1
+        v.mem_write(8, 0x3c); // 0x3c ror 1 = 0x1e; & 0xf0 = 0x10
+        let got: Vec<u8> = (0..4).map(|p| v.vram().plane(p)[8]).collect();
+        assert_eq!(got, [0x00, 0x10, 0x10, 0x00]);
+    }
+
+    #[test]
+    fn read_mode1_colour_compare() {
+        let mut v = vga();
+        mode12(&mut v);
+        let planes = [0b1100_0000u8, 0b1010_0000, 0b0000_0000, 0b1111_1111];
+        for (p, &b) in planes.iter().enumerate() {
+            seq(&mut v, 0x02, 1 << p);
+            v.mem_write(7, b);
+        }
+        gc(&mut v, 5, 0x08);
+        gc(&mut v, 2, 0b1011); // compare colour
+        gc(&mut v, 7, 0x0f);
+        // Pixel colours (plane3..0): bit7 = 1011, bit6 = 1001, bit5 = 1010, rest 1000.
+        assert_eq!(v.mem_read(7), 0b1000_0000);
+        gc(&mut v, 7, 0b1001); // ignore planes 1 and 2
+        assert_eq!(v.mem_read(7), 0b1100_0000);
+    }
+
+    #[test]
+    fn odd_even_text_mode() {
+        let mut v = vga();
+        // Mode 3: odd/even, window at 0xB8000.
+        v.io_write(0x3c2, 0x67);
+        seq(&mut v, 0x02, 0x03);
+        seq(&mut v, 0x04, 0x02);
+        gc(&mut v, 4, 0);
+        gc(&mut v, 6, 0x0e);
+        let base = 0x18000;
+        v.mem_write(base, b'A');
+        v.mem_write(base + 1, 0x1f);
+        v.mem_write(base + 2, b'B');
+        assert_eq!(v.vram().plane(0)[0], b'A');
+        assert_eq!(v.vram().plane(1)[0], 0x1f);
+        assert_eq!(v.vram().plane(0)[1], b'B');
+        assert_eq!(v.mem_read(base + 1), 0x1f);
+        // GR04 bit 1 selects planes 2/3 (the font planes).
+        gc(&mut v, 4, 2);
+        seq(&mut v, 0x02, 0x04);
+        v.mem_write(base + 4, 0x7e);
+        assert_eq!(v.vram().plane(2)[2], 0x7e);
+        // Outside the 32 KiB window.
+        assert_eq!(v.mem_read(0x0), 0xff);
+        assert_eq!(v.mem_read(0x10000), 0xff);
+    }
+
+    #[test]
+    fn chain4_mode13() {
+        let mut v = vga();
+        seq(&mut v, 0x02, 0x0f);
+        seq(&mut v, 0x04, 0x0e);
+        gc(&mut v, 6, 0x05);
+        for i in 0..8u32 {
+            v.mem_write(i, i as u8 + 1);
+        }
+        assert_eq!(v.vram().plane(1)[0], 2);
+        assert_eq!(v.vram().plane(0)[1], 5);
+        assert_eq!(v.mem_read(6), 7);
+        assert_eq!(v.lfb_read(0, 8), 0x0807_0605_0403_0201);
+        seq(&mut v, 0x02, 0x01);
+        v.mem_write(1, 0xee);
+        assert_eq!(v.mem_read(1), 2, "plane 1 write disabled");
+    }
+
+    #[test]
+    fn memory_map_modes() {
+        let mut v = vga();
+        mode12(&mut v);
+        v.mem_write(0x5, 0x11);
+        assert_eq!(v.mem_read(0x10005), 0xff, "0xB0000 unmapped in mode 1");
+        gc(&mut v, 6, 0x01); // 128 KiB at 0xA0000
+        v.mem_write(0x10005, 0x22);
+        assert_eq!(v.vram().plane(0)[0x10005], 0x22);
+        gc(&mut v, 6, 0x09); // 0xB0000-0xB7FFF
+        assert_eq!(v.mem_read(0x5), 0xff);
+        assert_eq!(v.mem_read(0x10005), 0x11, "0xB0005 is offset 5");
+    }
+
+    #[test]
+    fn fast_plane_only_when_exact() {
+        let mut v = vga();
+        mode12(&mut v);
+        assert_eq!(v.fast_plane(), None, "all four planes enabled");
+        seq(&mut v, 0x02, 0x01);
+        assert_eq!(v.fast_plane(), Some(0));
+        // TempleOS writes plane 1 with GR04 still 0: reads would differ.
+        seq(&mut v, 0x02, 0x02);
+        assert_eq!(v.fast_plane(), None);
+        gc(&mut v, 4, 1);
+        assert_eq!(v.fast_plane(), Some(1));
+        for (reg, val) in [(5u8, 0x01u8), (5, 0x08), (3, 0x08), (3, 0x01), (1, 0x02), (8, 0x7f), (6, 0x01)] {
+            let old = v.regs().gr[reg as usize];
+            gc(&mut v, reg, val);
+            assert_eq!(v.fast_plane(), None, "GR{reg:x}={val:#x}");
+            gc(&mut v, reg, old);
+        }
+        gc(&mut v, 1, 0x01); // set/reset on another plane doesn't matter
+        assert_eq!(v.fast_plane(), Some(1));
+        seq(&mut v, 0x04, 0x02);
+        assert_eq!(v.fast_plane(), None, "odd/even");
+        seq(&mut v, 0x04, 0x0e);
+        assert_eq!(v.fast_plane(), None, "chain 4");
+        // The predicate is what it claims: a mapped plane behaves like the model.
+        seq(&mut v, 0x04, 0x06);
+        let mut model = vga();
+        mode12(&mut model);
+        seq(&mut model, 0x02, 0x02);
+        gc(&mut model, 4, 1);
+        gc(&mut model, 1, 0x01);
+        for i in 0..64u32 {
+            model.mem_write(i, (i * 7) as u8);
+            v.vram_mut().plane_mut(1)[i as usize] = (i * 7) as u8;
+        }
+        for i in 0..64u32 {
+            assert_eq!(model.mem_read(i), v.vram().plane(1)[i as usize]);
+        }
+        for p in [0, 2, 3] {
+            assert!(model.vram().plane(p)[..64].iter().all(|&b| b == 0));
+        }
+    }
+
     #[test]
     fn rom_is_padded() {
         let v = Vga::new(&[0x55, 0xaa, 0x01]);
@@ -998,6 +1519,5 @@ mod tests {
         assert!(v.rom()[3..].iter().all(|&b| b == 0));
         let v = Vga::new(&vec![1; 39424]);
         assert_eq!(v.rom().len(), 65536);
-        assert_eq!(v.vram().len(), VRAM_SIZE);
     }
 }
