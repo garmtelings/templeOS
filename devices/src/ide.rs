@@ -801,7 +801,8 @@ impl Drive {
             self.hcyl = (cyl >> 8) as u8;
             self.lcyl = cyl as u8;
             self.select = (self.select & !DEV_HS) | ((r / secs) as u8 & DEV_HS);
-            self.sector = (r % secs) as u8 + 1;
+            // QEMU stores this in a byte: 256+ sectors per track wrap.
+            self.sector = ((r % secs) + 1) as u8;
         }
     }
 

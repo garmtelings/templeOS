@@ -146,7 +146,9 @@ impl Renderer {
             return;
         }
         let (line_offset, start_addr, line_compare) = basic_params(r);
-        let cursor = ((usize::from(r.cr[0x0e]) << 8) | usize::from(r.cr[0x0f])).wrapping_sub(start_addr);
+        // QEMU: cursor_ptr = vram + (start_addr + (cursor - start_addr)) * 4,
+        // i.e. the cursor address itself.
+        let cursor_src = ((usize::from(r.cr[0x0e]) << 8) | usize::from(r.cr[0x0f])) * 4;
 
         if now >= self.cursor_blink_time {
             self.cursor_blink_time = now + CURSOR_PERIOD_NS / 2;
@@ -179,7 +181,7 @@ impl Renderer {
                 for row in 0..cheight {
                     draw_glyph_row(&mut frame.pixels[(y0 + row) * stride + x0..], glyph(row), cw, fg, bg, dup9);
                 }
-                let is_cursor = src == (start_addr + cursor) * 4;
+                let is_cursor = src == cursor_src;
                 if is_cursor && r.cr[0x0a] & 0x20 == 0 && self.cursor_visible {
                     let start = usize::from(r.cr[0x0a] & 0x1f);
                     let last = usize::from(r.cr[0x0b] & 0x1f).min(cheight - 1);
