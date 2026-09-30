@@ -64,6 +64,9 @@ pub struct Shared {
     hwnd: Mutex<Option<usize>>,
     /// Keyboard and mouse events for the guest.
     pub input: Arc<InputQueue>,
+    /// A script is driving the machine: report errors on stderr and the exit
+    /// code, not in a message box nobody is there to close.
+    pub unattended: AtomicBool,
 }
 
 impl Shared {
@@ -75,6 +78,7 @@ impl Shared {
             exit_error: Mutex::new(None),
             hwnd: Mutex::new(None),
             input: Arc::new(InputQueue::new()),
+            unattended: AtomicBool::new(false),
         })
     }
 
@@ -95,6 +99,11 @@ impl Shared {
     pub fn vm_exited(&self, error: Option<String>) {
         *self.exit_error.lock().unwrap() = error;
         self.post(WM_APP_VM_EXIT);
+    }
+
+    /// Why the VM stopped, if it was an error.
+    pub fn exit_error(&self) -> Option<String> {
+        self.exit_error.lock().unwrap().clone()
     }
 
     fn post(&self, msg: u32) {
@@ -229,8 +238,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_APP_VM_EXIT => {
-                let error = UI.with(|ui| ui.borrow().as_ref().and_then(|ui| ui.shared.exit_error.lock().unwrap().take()));
-                if let Some(e) = error {
+                let (error, unattended) = UI.with(|ui| match ui.borrow().as_ref() {
+                    Some(ui) => (ui.shared.exit_error.lock().unwrap().clone(), ui.shared.unattended.load(Ordering::Relaxed)),
+                    None => (None, false),
+                });
+                if let Some(e) = error.filter(|_| !unattended) {
                     MessageBoxW(hwnd, &HSTRING::from(e), w!("TempleOS"), MB_ICONERROR | MB_OK);
                 }
                 let _ = DestroyWindow(hwnd);

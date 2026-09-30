@@ -1,0 +1,15 @@
+# Regions of cd_smoke's screenshots that TempleOS draws from the time, so
+# they differ between any two runs (tools/compare_shots.py --masks).
+# SHOT X0 Y0 X1 Y1, ends exclusive.
+
+# Top line (clock, CPU meters) and the window title row: titles scroll.
+*                   0   0 640  16
+# The AutoComplete window's title bar, which scrolls too.
+*                 392  96 640 104
+# Cursor blink.
+01-install-prompt 280 136 288 144
+02-shell           72 168  80 176
+# The shell's timing of the startup script and of Dir.
+02-shell            8 160 320 168
+03-dir              8 160 320 168
+03-dir              8 208  80 216

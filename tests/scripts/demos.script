@@ -1,17 +1,20 @@
 # TempleOS demos that exercise the hardware paths Phase 6 cares about.
-# Starter script: timings are guesses until tuned on a real run.
+# Waits are guest time on both machines (qemu_trace.py waits on QEMU's
+# -icount clock).
 wait 60
 type n
 wait 3
 type n
 wait 5
-# ScrnMemory reads and writes VGA memory directly (LBts with only plane 2
-# write-enabled): the case the VGA fast path must get right.
+# ScrnMemory reads and writes VGA memory directly (LBts, which WHPX's
+# emulator can't do, with single planes write-enabled): the case the VGA
+# fast path must get right. It draws, then Busy-waits 4 s with nothing else
+# running, so the screenshot 2 s in is its drawing alone. It doesn't wait
+# for a key.
 type \#include "::/Demo/Lectures/ScrnMemory.HC";\n
-wait 5
+wait 2
 screenshot 10-scrnmemory
-key spc
-wait 3
+wait 6
 # Hanoi: graphics, sound (Beep), then PressAKey.
 type \#include "::/Demo/Graphics/Hanoi.HC";\n
 wait 20

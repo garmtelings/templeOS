@@ -1,9 +1,11 @@
 //! The virtual machine monitor: runs the PC board from the `devices` crate
 //! on the Windows Hypervisor Platform (see PLAN.md).
 //!
-//! Only [`cpuid`] is platform independent; the rest needs Windows. Gating
-//! the Windows parts lets `cargo test -p vmm` run the CPUID tests anywhere.
+//! Only [`cpuid`] and [`bitop`] are platform independent; the rest needs
+//! Windows. Gating the Windows parts lets `cargo test -p vmm` run their
+//! tests anywhere.
 
+pub mod bitop;
 pub mod cpuid;
 #[cfg(windows)]
 pub mod machine;

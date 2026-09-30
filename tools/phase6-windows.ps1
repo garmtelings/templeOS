@@ -9,12 +9,12 @@
 # Runs, in order, and keeps going when one fails:
 #   1. cargo build --release and the workspace tests
 #   2. every tests\scripts\*.script on templeos.exe and on QEMU, and compares
-#      the screenshots pixel for pixel (top text line masked: clock, CPU meters)
+#      the screenshots pixel for pixel (masked: the top line, and whatever
+#      tests\scripts\NAME.masks lists as drawn from the time)
 #   3. records ref\boot in QEMU and replays it through the board
 # Everything lands in phase6-results\, with summary.txt listing pass/fail.
 
 param(
-    [double]$WaitScale = 10,   # QEMU's software CPU is slower than WHPX
     [int]$BootSeconds = 120
 )
 
@@ -62,9 +62,17 @@ foreach ($script in Get-ChildItem tests\scripts\*.script) {
     $ours = Join-Path $out "$name\ours"
     $qemu = Join-Path $out "$name\qemu"
     Remove-Item -Recurse -Force $ours, $qemu -ErrorAction SilentlyContinue
-    Step "$name-templeos" { & $exe --no-hdd --script $script.FullName --shots $ours }
-    Step "$name-qemu" { python tools\qemu-ref\qemu_trace.py --script $script.FullName --wait-scale $WaitScale --out $qemu }
-    Step "$name-compare" { python tools\compare_shots.py $ours $qemu --mask 0:8 }
+    # One CPU on both sides: qemu_trace.py runs -smp 1, and the core count
+    # changes what TempleOS allocates and so what it draws.
+    Step "$name-templeos" { & $exe --no-hdd --cpus 1 --script $script.FullName --shots $ours }
+    # Script waits are guest time on both machines (QEMU: its -icount clock,
+    # which with sleep=on follows the host's while the guest idles, as
+    # WHPX's does, so key gaps match too).
+    Step "$name-qemu" { python tools\qemu-ref\qemu_trace.py --script $script.FullName --no-trace --icount-sleep --out $qemu }
+    # tests\scripts\NAME.masks lists what the guest draws from the time.
+    $masks = [IO.Path]::ChangeExtension($script.FullName, '.masks')
+    $maskArgs = if (Test-Path $masks) { @('--masks', $masks) } else { @() }
+    Step "$name-compare" { python tools\compare_shots.py $ours $qemu --mask 0:8 @maskArgs }
 }
 
 # 3. Real boot recorded in QEMU, replayed through the board.

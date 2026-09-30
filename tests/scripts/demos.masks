@@ -1,0 +1,20 @@
+# Regions of demos' screenshots that TempleOS draws from the time, so they
+# differ between any two runs (tools/compare_shots.py --masks).
+# SHOT X0 Y0 X1 Y1, ends exclusive. 10-scrnmemory needs none.
+
+# Top line (clock, CPU meters) and the window title row: titles scroll.
+20-hanoi      0   0 640  16
+30-palette    0   0 640  16
+99-end        0   0 640  16
+# The AutoComplete window's title bar, which scrolls too.
+20-hanoi    392  96 640 104
+30-palette  392  96 640 104
+99-end      392  96 640 104
+# Hanoi's towers and move counter: how far the animation has got.
+20-hanoi      0 344 320 472
+# The shell's timing of the previous command.
+30-palette    8  16  96  24
+99-end        8  16  96  24
+# PressAKey's blinking prompts and the cursor blink.
+30-palette    8 168  96 192
+99-end        8 168  96 192

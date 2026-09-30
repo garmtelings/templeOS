@@ -365,6 +365,8 @@ fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let vm_shared = shared.clone();
     let vm_speaker = speaker.clone();
     let mut vm_thread = None;
+    let scripted = args.script.is_some();
+    shared.unattended.store(scripted, std::sync::atomic::Ordering::Relaxed);
     let script = args.script.clone().map(|steps| {
         let s = shared.clone();
         spawn_script(steps, shared.input.clone(), move || s.latest_frame(), shared.stop.clone(), args.shots.clone())
@@ -375,6 +377,9 @@ fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 .name("vcpu".into())
                 .spawn(move || {
                     let error = vm_thread_main(&args, &vm_shared, &vm_speaker).err().map(|e| e.to_string());
+                    if let Some(e) = &error {
+                        eprintln!("[vmm] error: {e}");
+                    }
                     vm_shared.vm_exited(error);
                 })
                 .expect("spawn VM thread"),
@@ -389,10 +394,14 @@ fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(t) = script {
         let _ = t.join();
     }
-    started.map_err(|e| {
+    if let Err(e) = started {
         window::error_box(&e);
-        e.into()
-    })
+        return Err(e.into());
+    }
+    match shared.exit_error() {
+        Some(e) if scripted => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 fn vm_thread_main(

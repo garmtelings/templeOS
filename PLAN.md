@@ -336,19 +336,44 @@ Done and passing here (no ISO or Windows needed):
 - [x] **Payload integrity**: build.rs pins, and the exe re-checks the
   SHA-256 of its embedded BIOS, VGA BIOS and ISO at every start.
 
-Ready, needs a Windows machine with the ISO. `tools/phase6-windows.ps1`
-runs the first two in one go and writes `phase6-results/summary.txt`:
-- [ ] **Scripted differential runs**: `templeos.exe --script S --shots A`
-  and `tools/qemu-ref/qemu_trace.py --script S --wait-scale 10 --out B`
-  run the same input script (`devices/src/script.rs`; type/key/mouse/
-  wait/screenshot) on both machines; `tools/compare_shots.py A B --mask
-  0:8` compares the screenshots pixel for pixel (the mask hides TempleOS's
-  clock line). Starter scripts: `tests/scripts/cd_smoke.script` and
-  `tests/scripts/demos.script` (ScrnMemory, the VGA fast-path case; Hanoi;
-  Palette).
-- [ ] **Whole-board replay of the TempleOS boot**:
+Needs a Windows machine with the ISO. `tools/phase6-windows.ps1` runs the
+first two in one go and writes `phase6-results/summary.txt`; all of it
+passed on Windows 11 (build 26300), 2026-09-30:
+- [x] **Scripted differential runs**: `templeos.exe --cpus 1 --script S
+  --shots A` and `tools/qemu-ref/qemu_trace.py --script S --icount-sleep
+  --no-trace --out B` run the same input script (`devices/src/script.rs`;
+  type/key/mouse/wait/screenshot) on both machines;
+  `tools/compare_shots.py A B --mask 0:8 --masks S.masks` compares the
+  screenshots pixel for pixel. Scripts: `tests/scripts/cd_smoke.script`
+  and `tests/scripts/demos.script` (ScrnMemory, the VGA fast-path case;
+  Hanoi; Palette). All 7 screenshots are identical outside the masks, and
+  ScrnMemory's frame is identical with no mask at all.
+  - Script waits are guest time on both machines: WHPX's guest clock is
+    the host's; on QEMU `qemu_trace.py` waits on the RTC, which runs on the
+    `-icount` clock, and `sleep=on` makes that clock follow the host's while
+    the guest idles, so the gaps between keys are the same guest time too.
+    (With a host-time `--wait-scale`, QEMU was still inside ScrnMemory's
+    4 s `Busy()` for every later screenshot.)
+  - `tests/scripts/NAME.masks` lists what TempleOS draws from the time:
+    scrolling window titles, the cursor and `PRESS A KEY` blink, the
+    shell's command timings, Hanoi's animation. Both sides run one CPU (the
+    core count changes TempleOS's allocations, which show in window titles).
+  - Found a real bug: WHPX's instruction emulator doesn't implement
+    BT/BTS/BTR/BTC, and ScrnMemory's `LBts` on VGA memory (`LOCK BTS
+    [RCX], R8`) stopped the VM. `vmm/src/bitop.rs` now decodes the bit-test
+    family when the emulator gives up on an MMIO access and runs the bit
+    operation on the host CPU, so the value and every flag are what this CPU
+    gives the same instruction on RAM. A VM error during `--script` now
+    goes to stderr and the exit code instead of a message box.
+  - Not explained yet, and not a device difference: after ScrnMemory
+    returns, TempleOS re-wraps its command line at the space on WHPX and
+    mid-word on QEMU (the same before it runs, and the same for a line that
+    only `Busy()`s). The demos script screenshots ScrnMemory mid-`Busy()`
+    instead, where the whole frame is exact.
+- [x] **Whole-board replay of the TempleOS boot**:
   `cargo test -p devices --test replay_board -- --ignored` against
-  `ref/boot/trace.log` (the kernel's own device traffic).
+  `ref/boot/trace.log` (the kernel's own device traffic): 0 mismatching
+  reads.
 - [ ] **In-guest tests**: run the demos and the kernel self-compile
   (`BootHDIns`) from a script, and check they complete.
 - Not planned: guest RAM hashes at an idle point. WHPX runs guest code on

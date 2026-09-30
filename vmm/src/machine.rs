@@ -39,6 +39,7 @@ use windows::core::HRESULT;
 use windows::Win32::Foundation::{E_FAIL, S_OK};
 use windows::Win32::System::Hypervisor::*;
 
+use crate::bitop;
 use crate::cpuid::Cpuid;
 use crate::memory::{GuestMemory, MemRef, VGA_HOLE};
 use crate::timer::HrTimer;
@@ -818,13 +819,18 @@ fn emulate(shared: &Shared, vp: u32, emulator: &Emulator, exit: &WHV_RUN_VP_EXIT
     let status = status.map_err(|e| Error(format!("{what} emulation call failed: {e}")))?;
     // SAFETY: bitfield over a u32; bit 0 is EmulationSuccessful.
     let bits = unsafe { status.AsUINT32 };
-    if bits & 1 == 0 {
+    // Bit 1 is InternalEmulationFailure: an instruction it doesn't implement.
+    // SAFETY: a non-I/O exit here is a memory access.
+    let emulated = bits & 1 != 0 || (!io && bits & 2 != 0 && emulate_bitop(shared, vp, unsafe { &exit.Anonymous.MemoryAccess })?);
+    if !emulated {
         // SAFETY: reading the exit union for diagnostics only.
         let detail = unsafe {
             if io {
                 format!("port {:#x}", exit.Anonymous.IoPortAccess.PortNumber)
             } else {
-                format!("gpa {:#x}", exit.Anonymous.MemoryAccess.Gpa)
+                let m = &exit.Anonymous.MemoryAccess;
+                let n = (m.InstructionByteCount as usize).min(m.InstructionBytes.len());
+                format!("gpa {:#x}, instruction {:02x?}", m.Gpa, &m.InstructionBytes[..n])
             }
         };
         return Err(Error(format!(
@@ -838,6 +844,54 @@ fn emulate(shared: &Shared, vp: u32, emulator: &Emulator, exit: &WHV_RUN_VP_EXIT
         shared.part.cancel(BSP);
     }
     Ok(())
+}
+
+/// WHPX's emulator doesn't implement BT/BTS/BTR/BTC: run one on device
+/// memory here (see [`bitop`]). False if the instruction isn't one.
+fn emulate_bitop(shared: &Shared, vp: u32, m: &WHV_MEMORY_ACCESS_CONTEXT) -> Result<bool> {
+    use devices::GuestMemory as _;
+    let names = [WHvX64RegisterRip, WHvX64RegisterRflags, WHvX64RegisterCs, WHvX64RegisterCr0, WHvX64RegisterEfer];
+    let mut regs = [WHV_REGISTER_VALUE::default(); 5];
+    shared.part.get_regs(vp, &names, &mut regs)?;
+    // SAFETY: CS is a segment register, the others are 64-bit.
+    let (rip, rflags, cs_attr, cr0, efer) =
+        unsafe { (regs[0].Reg64, regs[1].Reg64, regs[2].Segment.Anonymous.Attributes, regs[3].Reg64, regs[4].Reg64) };
+    // Code size: CR0.PE, EFER.LMA, CS.L, CS.D.
+    let mode = match (cr0 & 1 != 0, efer & 1 << 10 != 0, cs_attr & 1 << 13 != 0, cs_attr & 1 << 14 != 0) {
+        (false, ..) => 16,
+        (true, true, true, _) => 64,
+        (true, _, _, true) => 32,
+        _ => 16,
+    };
+    let n = (m.InstructionByteCount as usize).min(m.InstructionBytes.len());
+    let Some(insn) = bitop::decode(&m.InstructionBytes[..n], mode) else {
+        return Ok(false);
+    };
+    let number = match insn.bit {
+        bitop::BitSource::Imm(b) => b as u64,
+        // SAFETY: general-purpose registers are 64-bit; 0-15 are RAX-R15.
+        bitop::BitSource::Reg(r) => unsafe { shared.part.get_reg(vp, WHV_REGISTER_NAME(r as i32))?.Reg64 },
+    };
+    // The CPU has already computed the operand's address: the exit's GPA.
+    let (gpa, size) = (m.Gpa, insn.size as usize);
+    let now = shared.now();
+    // Read-modify-write under the board lock, so LOCK's atomicity holds
+    // against the other vCPUs.
+    let mut board = shared.board();
+    let mut buf = [0u8; 8];
+    let value = if shared.mem.read(gpa, &mut buf[..size]) {
+        u64::from_le_bytes(buf)
+    } else {
+        board.pc.mmio_read(gpa, size as u8, now)
+    };
+    let (new, flags) = bitop::execute(insn.op, insn.size, value, insn.bit_index(number), rflags);
+    if insn.op != bitop::Op::Test && !shared.mem.write_shared(gpa, &new.to_le_bytes()[..size]) {
+        board.pc.mmio_write(gpa, size as u8, new, now);
+    }
+    drop(board);
+    let values = [rip + insn.len as u64, flags].map(|v| WHV_REGISTER_VALUE { Reg64: v });
+    shared.part.set_regs(vp, &[WHvX64RegisterRip, WHvX64RegisterRflags], &values)?;
+    Ok(true)
 }
 
 /// A register dump for error reports.

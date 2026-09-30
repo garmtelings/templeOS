@@ -19,8 +19,10 @@ Outputs, in --out:
 """
 
 import argparse
+import calendar
 import hashlib
 import json
+import math
 import os
 import socket
 import subprocess
@@ -82,6 +84,21 @@ class QMP:
                 return reply["return"]
 
 
+def guest_seconds(qmp):
+    """The guest's RTC in whole seconds. With -rtc clock=vm it runs on
+    QEMU's virtual clock, which under -icount counts instructions."""
+    t = qmp.cmd("qom-get", path="/machine", property="rtc-time")
+    return calendar.timegm((t["tm_year"] + 1900, t["tm_mon"] + 1, t["tm_mday"],
+                            t["tm_hour"], t["tm_min"], t["tm_sec"]))
+
+
+def guest_wait(qmp, seconds):
+    """Wait until at least `seconds` of guest time have passed (the RTC
+    ticks in whole seconds, so it can be up to one second more)."""
+    until = guest_seconds(qmp) + math.ceil(seconds) + 1
+    while guest_seconds(qmp) < until:
+        time.sleep(0.05)
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -101,7 +118,18 @@ def main():
     ap.add_argument("--script", help="run this input script (see "
                     "devices/src/script.rs) instead of periodic screenshots")
     ap.add_argument("--wait-scale", type=float, default=1.0,
-                    help="multiply script waits (QEMU's software CPU is slower)")
+                    help="with --no-icount, multiply script waits (QEMU's "
+                         "software CPU is slower); with -icount, script waits "
+                         "are guest time and this is ignored")
+    ap.add_argument("--icount-sleep", action="store_true",
+                    help="-icount with sleep=on: while the guest idles its clock "
+                         "follows the host's, as on WHPX, so the host-timed gaps "
+                         "between script keys are the same guest time on both "
+                         "machines (sleep=off jumps the clock ahead while idle; "
+                         "repeatable, but a 20 ms key gap becomes any length)")
+    ap.add_argument("--no-trace", action="store_true",
+                    help="don't record trace.log (script runs only need the "
+                         "screenshots, and tracing makes QEMU much slower)")
     ap.add_argument("--qemu", default="qemu-system-x86_64")
     args = ap.parse_args()
 
@@ -135,12 +163,16 @@ def main():
         "-qmp", qmp_arg,
         "-chardev", f"file,id=dbg,path={os.path.join(args.out, 'debugcon.log')}",
         "-device", "isa-debugcon,iobase=0x402,chardev=dbg",
-        "-trace", f"events={os.path.join(HERE, 'events.txt')},"
-                  f"file={os.path.join(args.out, 'trace.log')}",
         "-S",  # start paused so the first screenshot is at t=0
     ]
+    trace = os.path.join(args.out, "trace.log")
+    if os.path.exists(trace):
+        os.unlink(trace)
+    if not args.no_trace:
+        cmd += ["-trace", f"events={os.path.join(HERE, 'events.txt')},file={trace}"]
     if not args.no_icount:
-        cmd += ["-icount", "shift=0,sleep=off,align=off"]
+        sleep = "on" if args.icount_sleep else "off"
+        cmd += ["-icount", f"shift=0,sleep={sleep},align=off"]
     iso = None if args.iso == "none" else args.iso
     if iso:
         cmd += ["-drive", f"file={iso},media=cdrom,if=ide,index=2,readonly=on"]
@@ -173,7 +205,8 @@ def main():
                 shots.append({"file": os.path.basename(path),
                               "host_seconds": round(time.monotonic() - start, 3),
                               "sha256": sha256(path) if os.path.exists(path) else None})
-            inputscript.run(steps, qmp, args.out, args.wait_scale, on_shot)
+            wait = None if args.no_icount else (lambda s: guest_wait(qmp, s))
+            inputscript.run(steps, qmp, args.out, args.wait_scale, on_shot, wait)
         while not args.script:
             elapsed = time.monotonic() - start
             path = os.path.join(args.out, f"shot-{n:04d}.ppm")
@@ -200,8 +233,8 @@ def main():
                 "screenshots": shots}
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"wrote {args.out}: {len(shots)} screenshots, "
-          f"trace {os.path.getsize(os.path.join(args.out, 'trace.log'))} bytes")
+    size = f"trace {os.path.getsize(trace)} bytes" if os.path.exists(trace) else "no trace"
+    print(f"wrote {args.out}: {len(shots)} screenshots, {size}")
     return 0
 
 

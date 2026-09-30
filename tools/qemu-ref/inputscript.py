@@ -95,13 +95,18 @@ def parse(text):
 BUTTONS = [(1, "left"), (2, "right"), (4, "middle")]
 
 
-def run(steps, qmp, out_dir, wait_scale=1.0, on_shot=None):
-    """Execute steps against a QEMU QMP connection."""
+def run(steps, qmp, out_dir, wait_scale=1.0, on_shot=None, wait=None):
+    """Execute steps against a QEMU QMP connection. `wait(seconds)`, if
+    given, waits in guest time; otherwise waits are host time times
+    `wait_scale`."""
     held = 0
     for step in steps:
         kind = step[0]
         if kind == "wait":
-            time.sleep(step[1] * wait_scale)
+            if wait:
+                wait(step[1])
+            else:
+                time.sleep(step[1] * wait_scale)
         elif kind == "keys":
             for key, down in step[1]:
                 qmp.cmd("input-send-event", events=[

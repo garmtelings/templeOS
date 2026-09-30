@@ -16,19 +16,15 @@ and the phase status; docs/hw-surface.md is the device spec.
 
 ## Pending on the user's Windows PC — remind them at the start of a session
 
-The Phase 6 checks that need WHPX and the ISO have not been run yet. When a
-session starts on the user's Windows machine, remind them of this first and
-offer to run it:
+`tools\phase6-windows.ps1` passes on the user's PC (2026-09-30: 10/10).
+What's left needs a person at the window; when a session starts on the
+user's Windows machine, remind them of it first:
 
-1. `git pull origin claude/templeos-windows-binary-rlrv6x`
-2. Put the ISO in `payload\TempleOS.ISO` (or `bash tools/fetch-payload.sh`).
-3. Needs Rust, Python 3 and `qemu-system-x86_64` on PATH, and the Windows
-   Hypervisor Platform turned on.
-4. `powershell -ExecutionPolicy Bypass -File tools\phase6-windows.ps1`
-5. Read `phase6-results\summary.txt`; for each FAIL, read its log (and the
-   differing screenshots under `phase6-results\<script>\`) and fix the cause.
-6. By hand: run the demos in TempleOS and install to the hard disk
-   (BootHDIns), then boot from the disk.
+1. In the TempleOS window, with the real keyboard and mouse: type in the
+   shell, click to capture the mouse, check the PC speaker is audible (e.g.
+   a hymn).
+2. Run demos by hand, then install to the hard disk (BootHDIns) and boot
+   from the disk.
 
-When all of it passes, mark the Phase 6 items in PLAN.md done and delete
-this section.
+When both are done, tick the In-guest tests item in PLAN.md's Phase 6 (and
+the Phase 4 "still to check by hand" note) and delete this section.
