@@ -99,8 +99,8 @@ impl Pc {
 
     /// CMOS configuration bytes as QEMU's pc_cmos_init and
     /// pc_cmos_init_late write them for this machine: no floppy, `cpus` CPUs.
-    /// Without a hard disk it boots from the CD (the reference machine's
-    /// `-boot d`); with one it uses QEMU's default order, hard disk first
+    /// With only a CD it boots from the CD (the reference machine's
+    /// `-boot d`); otherwise it uses QEMU's default order, hard disk first
     /// and CD last, so an installed TempleOS boots from the disk and a blank
     /// disk falls through to the CD.
     fn init_cmos(&mut self, ram_size: u64, cpus: u8) {
@@ -117,8 +117,6 @@ impl Pc {
             (0x31, (ext_kib >> 8) as u8),
             (0x34, above_16m as u8),
             (0x35, (above_16m >> 8) as u8),
-            (0x38, 0x00), // third boot device none, floppy signature check on
-            (0x3D, 0x03), // first boot device CD-ROM
             (0x5F, cpus - 1), // CPUs - 1
         ];
         for (index, val) in bytes {
@@ -141,13 +139,21 @@ impl Pc {
                 (0x23, g.sectors as u8),
                 // Translation hints, 2 bits per drive: QEMU's constant - 1.
                 (0x39, g.translation - 1),
-                // Boot order "cad": hard disk, floppy, CD.
-                (0x3d, 0x12),
-                (0x38, 0x30),
             ] {
                 self.rtc.set_nvram(index, val);
             }
         }
+        // Boot order (0x3D: first and second device, 0x38 bits 7-4: third;
+        // 1 floppy, 2 hard disk, 3 CD; 0x38 bit 0 clear = floppy signature
+        // check on): a CD alone boots first (`-boot d`), otherwise QEMU's
+        // default "cad".
+        let (first, third) = if self.ide[1].has_cdrom() && self.ide[0].disk_geometry(0).is_none() {
+            (0x03, 0x00)
+        } else {
+            (0x12, 0x30)
+        };
+        self.rtc.set_nvram(0x3D, first);
+        self.rtc.set_nvram(0x38, third);
     }
 
     /// Record every port and MMIO access, in the format of the QEMU

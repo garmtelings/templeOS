@@ -1764,6 +1764,11 @@ pub struct IdeChannel {
 }
 
 impl IdeChannel {
+    /// True if the master slot holds a CD.
+    pub fn has_cdrom(&self) -> bool {
+        self.drives[0].is_cd()
+    }
+
     /// The disk geometry of drive `unit`, for the CMOS setup QEMU's
     /// `pc_cmos_init` does. None if the slot holds no hard disk.
     pub fn disk_geometry(&self, unit: usize) -> Option<Geometry> {
