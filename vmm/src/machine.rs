@@ -474,6 +474,19 @@ impl Machine {
                 last_report = Instant::now();
                 let rip = shared.part.get_reg(BSP, WHvX64RegisterRip).map(|v| unsafe { v.Reg64 }).unwrap_or(0);
                 eprintln!("[debug] exits {counts:?} rip={rip:#x} pic_int={}", shared.board().pc.has_interrupt());
+                if std::env::var("TEMPLEOS_DEBUG").is_ok_and(|v| v == "regs") {
+                    let ram = shared.mem.ram();
+                    let at = (rip as usize).saturating_sub(32).min(ram.len().saturating_sub(96));
+                    eprintln!(
+                        "[debug] now={} halted={:?} window={} {}\n{}\n[debug] code at {at:#x}: {:02x?}",
+                        shared.now(),
+                        self.halted,
+                        self.window_registered,
+                        shared.board().pc.irq_debug(),
+                        dump_regs(&shared.part, BSP),
+                        &ram[at..at + 96]
+                    );
+                }
             }
             if let Some(e) = shared.ap_error.lock().unwrap().take() {
                 return Err(Error(e));
@@ -565,6 +578,9 @@ impl Machine {
         };
         if hz != self.speaker_hz {
             self.speaker_hz = hz;
+            if std::env::var_os("TEMPLEOS_DEBUG").is_some() {
+                eprintln!("[speaker {:9.3}s] {hz:?}", self.shared.start.elapsed().as_secs_f64());
+            }
             if let Some(f) = &mut self.speaker {
                 f(hz);
             }
@@ -628,6 +644,19 @@ impl Machine {
             let event = 1u64 | (WHvX64PendingEventExtInt.0 as u64) << 1 | (vector as u64) << 8;
             let value = WHV_REGISTER_VALUE { Reg128: WHV_UINT128 { Anonymous: WHV_UINT128_0 { Low64: event, High64: 0 } } };
             part.set_regs(BSP, &[WHvRegisterPendingEvent], &[value])?;
+            // With its local APIC emulated, the hypervisor handles HLT itself
+            // (no Halt exit), and a pending ExtINT does not wake a vCPU it
+            // has suspended in HLT: take it out of that state, as the
+            // interrupt would on a real CPU.
+            // WHV_INTERNAL_ACTIVITY_REGISTER: HaltSuspend is bit 1.
+            const HALT_SUSPEND: u64 = 1 << 1;
+            // SAFETY: the activity state is a 64-bit register.
+            if let Ok(state) = part.get_reg(BSP, WHvRegisterInternalActivityState).map(|v| unsafe { v.Reg64 }) {
+                if state & HALT_SUSPEND != 0 {
+                    let awake = WHV_REGISTER_VALUE { Reg64: state & !HALT_SUSPEND };
+                    part.set_regs(BSP, &[WHvRegisterInternalActivityState], &[awake])?;
+                }
+            }
         } else if !self.window_registered {
             // WHV_X64_DELIVERABILITY_NOTIFICATIONS_REGISTER: InterruptNotification is bit 1.
             let value = WHV_REGISTER_VALUE { Reg64: 1 << 1 };

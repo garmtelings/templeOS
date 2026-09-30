@@ -481,6 +481,11 @@ impl Pc {
         self.pic.has_interrupt()
     }
 
+    /// The PIC's IRR/IMR/ISR and the next PIT event, for debug output.
+    pub fn irq_debug(&self) -> String {
+        format!("{} pit_next={:?}", self.pic.debug_state(), self.pit.next_event())
+    }
+
     /// The CPU's interrupt-acknowledge cycle: returns the vector to deliver.
     pub fn acknowledge_interrupt(&mut self) -> u8 {
         let v = self.pic.acknowledge();

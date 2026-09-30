@@ -299,6 +299,15 @@ impl Pic {
         }
     }
 
+    /// IRR/IMR/ISR of both chips, for debug output.
+    pub fn debug_state(&self) -> String {
+        let (m, s) = (&self.master, &self.slave);
+        format!(
+            "master irr={:02x} imr={:02x} isr={:02x} slave irr={:02x} imr={:02x} isr={:02x}",
+            m.irr, m.imr, m.isr, s.irr, s.imr, s.isr
+        )
+    }
+
     /// Level of the master's INT output (the CPU's INTR / LINT0 ExtINT).
     pub fn has_interrupt(&self) -> bool {
         self.master.pending().is_some()

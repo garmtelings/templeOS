@@ -215,9 +215,15 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   VBE), per-monitor DPI aware. The VM runs on its own thread; a guest reboot
   restarts the machine; closing the window stops it. Started by double-click,
   the console window closes itself. `--headless` keeps the Phase 1-2 CLI.
-- **Milestone: the TempleOS desktop renders.** Not yet confirmed: needs a run
-  on Windows with the ISO. `--exact-vga` vs default is the first A/B to try
-  if anything looks wrong.
+- **Milestone: the TempleOS desktop renders.** ✅ Confirmed on Windows 11
+  (build 26300) with the ISO, 2026-09-30: the desktop is up ~8 s after
+  power-on; `--exact-vga` and the default draw the same screens.
+  - The first run froze ~2 s in: on this Windows build the hypervisor
+    handles HLT itself when it emulates the local APIC (no Halt exit), and a
+    pending ExtINT doesn't wake a vCPU it has suspended in HLT, so the first
+    timer tick in TempleOS's idle loop was lost with IRQ0 left in service.
+    `inject_interrupts` now clears HaltSuspend in
+    `WHvRegisterInternalActivityState` when it injects.
 
 ### Phase 4 — Input and sound
 - [x] Keyboard: the window reads keys with Raw Input (set 1 make codes plus
@@ -251,8 +257,12 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   sequence. No audio device: silent, with a note on stderr.
 - Not done: the Windows key still opens the Start menu (would need a
   low-level keyboard hook).
-- **Milestone: interactive shell, hymns play.** Not yet confirmed: needs a
-  run on Windows with the ISO.
+- **Milestone: interactive shell, hymns play.** ✅ Confirmed 2026-09-30 with
+  scripted input: `Dir;` runs in the shell; `Play("4qCDEFGAB5C")` gives
+  eight tones of the right pitch and length; the Psalmody hymn `prosper`
+  runs in the window with WASAPI open (101 tone changes in 15 s). Still to
+  check by hand: real keyboard and mouse (Raw Input) in the window, and
+  that the sound is audible.
 
 ### Phase 5 — Multicore, timing and disk
 - [x] **Hard disk** (`devices/src/ide.rs`): an ATA disk on the primary
@@ -293,8 +303,13 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   without a shorthand (passed to the hypervisor as is; SeaBIOS and TempleOS
   always use shorthands).
 - **Milestone: installs to C:, reboots from HDD, all cores show in the task
-  bar.** Not yet confirmed: needs a run on Windows with the ISO. The new
-  `--until ap-started` milestone (first SIPI) is the quick multicore check.
+  bar.** ✅ Confirmed 2026-09-30 with scripted input: the VM install wizard
+  partitions and formats C: and D:, copies the tree, compiles the kernel
+  and writes the boot record in under two minutes; "Reboot Now" resets the
+  machine; the disk then boots through the TempleOS boot loader menu to
+  `C:/Home>`. The task bar shows every core (4 with `--cpus 4`, 8 by
+  default here). The `--until ap-started` milestone (first SIPI) is the
+  quick multicore check.
 
 ### Phase 6 — Proving "perfect"
 Done and passing here (no ISO or Windows needed):
