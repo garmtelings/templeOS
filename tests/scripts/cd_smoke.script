@@ -1,0 +1,13 @@
+# Boot the TempleOS CD, decline install and tour, list the root directory.
+# The first screenshot is taken at the install prompt. Waits are generous;
+# for QEMU's software CPU use qemu_trace.py --wait-scale (e.g. 10).
+wait 60
+screenshot 01-install-prompt
+type n
+wait 3
+type n
+wait 5
+screenshot 02-shell
+type Dir;\n
+wait 5
+screenshot 03-dir

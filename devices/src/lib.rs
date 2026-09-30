@@ -57,6 +57,7 @@ pub mod vga_render;
 
 pub mod input;
 pub mod keymap;
+pub mod script;
 
 #[cfg(not(any(dev_only = "timers", dev_only = "ide", dev_only = "chipset", dev_only = "vga")))]
 pub mod pc;

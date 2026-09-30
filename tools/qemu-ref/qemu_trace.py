@@ -94,6 +94,10 @@ def main():
     ap.add_argument("--no-icount", action="store_true",
                     help="run free (faster, not repeatable)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--script", help="run this input script (see "
+                    "devices/src/script.rs) instead of periodic screenshots")
+    ap.add_argument("--wait-scale", type=float, default=1.0,
+                    help="multiply script waits (QEMU's software CPU is slower)")
     ap.add_argument("--qemu", default="qemu-system-x86_64")
     args = ap.parse_args()
 
@@ -149,7 +153,17 @@ def main():
         qmp.cmd("cont")
         start = time.monotonic()
         n = 0
-        while True:
+        if args.script:
+            sys.path.insert(0, HERE)
+            import inputscript
+            steps = inputscript.parse(open(args.script).read())
+
+            def on_shot(path):
+                shots.append({"file": os.path.basename(path),
+                              "host_seconds": round(time.monotonic() - start, 3),
+                              "sha256": sha256(path) if os.path.exists(path) else None})
+            inputscript.run(steps, qmp, args.out, args.wait_scale, on_shot)
+        while not args.script:
             elapsed = time.monotonic() - start
             path = os.path.join(args.out, f"shot-{n:04d}.ppm")
             qmp.cmd("screendump", filename=path)

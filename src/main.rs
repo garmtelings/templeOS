@@ -50,6 +50,9 @@ fullscreen. All other keys go to TempleOS.
   --rtc-base UNIX     guest clock at power-on, Unix seconds (default: now)
   --exact-vga         emulate every VGA memory access (no plane mapping)
   --screenshot FILE   save the display as a PPM when stopping
+  --script FILE       run an input script (type, key, mouse, wait,
+                      screenshot; see devices/src/script.rs), then stop
+  --shots DIR         where the script's screenshots go (default: shots)
   --debugcon FILE     also write the SeaBIOS debug console to FILE
   --trace FILE        log every port/MMIO access in QEMU trace format
                       (implies --exact-vga)
@@ -58,6 +61,8 @@ fullscreen. All other keys go to TempleOS.
 ";
 
 struct Args {
+    script: Option<Vec<devices::script::Step>>,
+    shots: String,
     cpus: Option<u32>,
     hdd: Option<String>,
     no_hdd: bool,
@@ -79,6 +84,8 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
+        script: None,
+        shots: "shots".into(),
         cpus: None,
         hdd: None,
         no_hdd: false,
@@ -103,6 +110,12 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--headless" => a.headless = true,
             "--hdd" => a.hdd = Some(value()?),
+            "--script" => {
+                let path = value()?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                a.script = Some(devices::script::parse(&text).map_err(|e| format!("{path}: {e}"))?);
+            }
+            "--shots" => a.shots = value()?,
             "--cpus" => {
                 let n: u32 = value()?.parse().map_err(|_| "bad --cpus")?;
                 if !(1..=vmm::machine::MAX_CPUS).contains(&n) {
@@ -265,6 +278,55 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
     Ok(m)
 }
 
+/// Run an input script against a running machine: keys and mouse go to
+/// `input` (20 ms apart, as tools/qemu-ref/inputscript.py paces QEMU),
+/// screenshots are taken from `frame()`. Sets `stop` when done.
+fn spawn_script(
+    steps: Vec<devices::script::Step>,
+    input: Arc<devices::input::InputQueue>,
+    frame: impl Fn() -> devices::vga_render::Frame + Send + 'static,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    shots: String,
+) -> std::thread::JoinHandle<()> {
+    use devices::input::InputEvent;
+    use devices::script::Step;
+    const GAP: Duration = Duration::from_millis(20);
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(&shots);
+        for step in steps {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            match step {
+                Step::Wait(s) => std::thread::sleep(Duration::from_secs_f64(s.max(0.0))),
+                Step::Keys(events) => {
+                    for (name, pressed) in events {
+                        let bytes = devices::script::keys_to_set2(&[(name, pressed)]);
+                        for b in bytes {
+                            input.push(InputEvent::Key(b));
+                        }
+                        std::thread::sleep(GAP);
+                    }
+                }
+                Step::Mouse { dx, dy, buttons } => {
+                    // Scripts use screen coordinates (y down); PS/2's y is up.
+                    input.push(InputEvent::Mouse { dx, dy: -dy, dz: 0, buttons });
+                    std::thread::sleep(GAP);
+                }
+                Step::Screenshot(name) => {
+                    let path = std::path::Path::new(&shots).join(format!("{name}.ppm"));
+                    match std::fs::write(&path, frame().to_ppm()) {
+                        Ok(()) => println!("[script] screenshot {}", path.display()),
+                        Err(e) => eprintln!("[script] {}: {e}", path.display()),
+                    }
+                }
+            }
+        }
+        println!("[script] done");
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    })
+}
+
 /// Size of a newly created hard disk image.
 const HDD_SIZE: u64 = 2 << 30;
 
@@ -303,6 +365,10 @@ fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let vm_shared = shared.clone();
     let vm_speaker = speaker.clone();
     let mut vm_thread = None;
+    let script = args.script.clone().map(|steps| {
+        let s = shared.clone();
+        spawn_script(steps, shared.input.clone(), move || s.latest_frame(), shared.stop.clone(), args.shots.clone())
+    });
     let started = window::run(shared.clone(), args.fullscreen, || {
         vm_thread = Some(
             std::thread::Builder::new()
@@ -320,6 +386,9 @@ fn run_windowed(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     speaker.stop();
     let _ = audio_thread.join();
+    if let Some(t) = script {
+        let _ = t.join();
+    }
     started.map_err(|e| {
         window::error_box(&e);
         e.into()
@@ -368,6 +437,16 @@ fn hide_console_if_ours() {
 fn run_headless(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut m = machine(args)?;
     let limit = args.seconds.map(Duration::from_secs_f64);
+    let _script = args.script.clone().map(|steps| {
+        let latest = Arc::new(std::sync::Mutex::new(devices::vga_render::Frame::default()));
+        let store = latest.clone();
+        m.set_display(Box::new(move |f| store.lock().unwrap().clone_from(f)));
+        let input = Arc::new(devices::input::InputQueue::new());
+        m.set_input(input.clone());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        m.set_stop_flag(stop.clone());
+        spawn_script(steps, input, move || latest.lock().unwrap().clone(), stop, args.shots.clone())
+    });
     let stop = m.run(args.until, limit)?;
     match stop {
         Stop::Milestone(ms) => println!("[vmm] stopped at milestone: {}", ms.describe()),

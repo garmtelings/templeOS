@@ -86,6 +86,11 @@ impl Shared {
         }
     }
 
+    /// The frame most recently presented.
+    pub fn latest_frame(&self) -> Frame {
+        self.frame.lock().unwrap().clone()
+    }
+
     /// Called on the VM thread when it's done; `error` is shown in a message box.
     pub fn vm_exited(&self, error: Option<String>) {
         *self.exit_error.lock().unwrap() = error;

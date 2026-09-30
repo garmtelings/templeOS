@@ -297,20 +297,48 @@ covers WHPX, Win32 and D3D11. We can cross-compile from Linux CI with
   `--until ap-started` milestone (first SIPI) is the quick multicore check.
 
 ### Phase 6 — Proving "perfect"
-- **Image integrity:** startup self-check of the embedded ISO hash. CI fails
-  if the payload ever differs from the pinned hash.
-- **Differential device testing:** a record/replay harness feeds identical
-  scripted input (keystrokes, timer ticks) to QEMU and to our VMM and
-  compares:
-  - the sequence of port I/O and MMIO accesses + values returned,
-  - framebuffer hashes at checkpoints,
-  - guest RAM hashes after boot reaches a deterministic idle point
-    (single-core, fixed TSC).
-- **In-guest tests:** run TempleOS's own demos and self-tests
-  (`/Demo/*`, compiling the kernel from source in-guest with `BootHDIns`)
-  and check that they complete.
-- Fuzz the device models (port/MMIO sequences) so malformed guest behavior
-  can't crash the host.
+Done and passing here (no ISO or Windows needed):
+- [x] **Whole-board replay** (`devices/tests/replay_board.rs`): a complete
+  QEMU reference trace replayed into the whole board through its own
+  routing, every read that doesn't depend on time compared. On the three
+  ISO-free references (SeaBIOS text screen, mode 12h boot sector, ATA probe
+  disk), each including SeaBIOS's full POST: 117,734 / 143,318 / 101,080
+  accesses, 0 mismatches. It found one real bug (the CMOS boot order
+  without a CD). Time-dependent reads (PIT, RTC time, HPET/PM timer
+  counters, PIC IRR/ISR, fw_cfg after DMA, IDE BSY polls) are executed but
+  not compared: the trace has no timestamps.
+- [x] **Per-device replays** (Phases 2-5): IDE (incl. the disk image),
+  PCI, VGA (reads + final frame vs QEMU's screendump, pixel exact).
+- [x] **Keyboard vs QEMU** (`devices/tests/replay_input.rs`,
+  `tools/qemu-ref/input_ref.py`): every printable ASCII character and
+  every other key, sent to QEMU with QMP and through our script path: the
+  436 bytes SeaBIOS read from port 0x60 are identical. (It caught one
+  naming slip: QEMU's context-menu key is `compose`.)
+- [x] **Fuzzing** (`devices/tests/fuzz_board.rs`): random and structured
+  guest behaviour against the whole board; no panics, no operation may
+  stall the host. It found two overflow bugs (text cursor position; CHS
+  sector wrap), both fixed. 30M+ operations clean since.
+- [x] **Payload integrity**: build.rs pins, and the exe re-checks the
+  SHA-256 of its embedded BIOS, VGA BIOS and ISO at every start.
+
+Ready, needs a Windows machine with the ISO:
+- [ ] **Scripted differential runs**: `templeos.exe --script S --shots A`
+  and `tools/qemu-ref/qemu_trace.py --script S --wait-scale 10 --out B`
+  run the same input script (`devices/src/script.rs`; type/key/mouse/
+  wait/screenshot) on both machines; `tools/compare_shots.py A B --mask
+  0:8` compares the screenshots pixel for pixel (the mask hides TempleOS's
+  clock line). Starter scripts: `tests/scripts/cd_smoke.script` and
+  `tests/scripts/demos.script` (ScrnMemory, the VGA fast-path case; Hanoi;
+  Palette).
+- [ ] **Whole-board replay of the TempleOS boot**:
+  `cargo test -p devices --test replay_board -- --ignored` against
+  `ref/boot/trace.log` (the kernel's own device traffic).
+- [ ] **In-guest tests**: run the demos and the kernel self-compile
+  (`BootHDIns`) from a script, and check they complete.
+- Not planned: guest RAM hashes at an idle point. WHPX runs guest code on
+  the real CPU at real speed, so two runs never reach the same instruction
+  at the same timer tick; screenshots after the guest settles are the
+  comparable state.
 
 ### Phase 7 — Packaging and release
 - A static single exe, a reproducible build (pinned toolchain + blobs →

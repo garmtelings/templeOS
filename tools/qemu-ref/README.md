@@ -57,3 +57,28 @@ TEMPLEOS_HDD=ref/disk/initial.img TEMPLEOS_HDD_FINAL=ref/disk/disk.img \
 
 Every register read must match, and the model's disk must end up
 byte-identical to the image QEMU wrote.
+
+## Whole-board replay
+
+Any trace can be replayed into the complete board (all devices, the
+board's own port and MMIO routing); every read that doesn't depend on time
+must match:
+
+```sh
+cargo test -p devices --test replay_board -- --ignored              # ref/boot, needs the ISO
+TEMPLEOS_TRACE=ref/disk/trace.log TEMPLEOS_CD=none TEMPLEOS_HDD=ref/disk/initial.img \
+    cargo test -p devices --test replay_board -- --ignored
+```
+
+## Input scripts
+
+`qemu_trace.py --script FILE` runs an input script (grammar in
+`devices/src/script.rs`; Python side in `inputscript.py`) through QMP instead
+of taking periodic screenshots; `--wait-scale` stretches its waits for
+QEMU's slower software CPU. `templeos.exe --script FILE --shots DIR` runs the
+same script. Compare the screenshots with `tools/compare_shots.py`.
+
+`input_ref.py` records `ref/input`, a run that types every printable
+character and presses every other key; `cargo test -p devices --test
+replay_input -- --ignored` checks our script path produces exactly the bytes
+SeaBIOS read in QEMU.
