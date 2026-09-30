@@ -368,8 +368,12 @@ Done:
   Hosted runners can't boot the VM (no nested virtualization); booting stays
   with `tools/phase6-windows.ps1` on a real PC.
 
+- [x] **First green CI run** (commit 0bbd5a1): the MSVC exe's imports
+  are Windows DLLs only, WinHvPlatform/WinHvEmulation delay-loaded, and two
+  builds from different folders give the same SHA-256
+  (1f1bdf6ee7d8eb2b6f8f29ed36e22029d7a5f62c956ccfa9cd72f78534da18f5).
+
 Not done:
-- [ ] First green CI run (the MSVC link options are untested until then).
 - [ ] Optional: an Authenticode signature (needs a certificate), an icon
   and version resource.
 
