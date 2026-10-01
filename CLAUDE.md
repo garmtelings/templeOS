@@ -1,12 +1,16 @@
 # TempleOS.exe
 
 TempleOS V5.03 (the official ISO, unmodified) in one Windows exe, on a
-purpose-built VMM over the Windows Hypervisor Platform (WHPX). QEMU 8.2 is
+purpose-built VMM over the Windows Hypervisor Platform (WHPX), or, without
+it, on Bochs's CPU core (softcpu/, a submodule: clone with
+`--recurse-submodules` or run `git submodule update --init --depth 1`). QEMU 8.2 is
 the reference machine: device models must match it. PLAN.md has the design
 and the phase status; docs/hw-surface.md is the device spec.
 
 - `devices/`: the board (PIC, PIT, RTC, PS/2, VGA, IDE, PCI, HPET, ...), pure
-  Rust, tested on any OS. `vmm/`: WHPX partition and vCPU loop (Windows).
+  Rust, tested on any OS. `vmm/`: WHPX partition and vCPU loop (Windows),
+  and `SoftMachine` on the software CPU (any OS; boots TempleOS on Linux:
+  `cargo run -p vmm --release --example softrun`, `tools/soft-vs-qemu.sh`).
   `src/`: the exe (window, input, audio).
 - Tests: `cargo test --workspace`. Replays against QEMU traces are
   `--ignored`; see tools/qemu-ref/README.md.

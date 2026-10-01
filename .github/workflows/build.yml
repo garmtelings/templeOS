@@ -1,10 +1,11 @@
 # Builds TempleOS.exe on every push and pull request; a v* tag also publishes
 # it as a GitHub release with its SHA-256.
 #
-# Hosted runners have no nested virtualization, so the VM itself isn't booted
-# here: the device tests, the fuzzer and the QEMU-trace replays run, and the
-# exe is checked for its imports and for being reproducible. Booting is
-# tools/phase6-windows.ps1, on a real Windows PC.
+# Hosted runners have no nested virtualization, so the hypervisor machine
+# isn't booted here (that is tools/phase6-windows.ps1, on a real Windows PC).
+# The software CPU is: it boots TempleOS on Linux and must draw the same
+# screens as QEMU for every test script. Also run: the device tests, the
+# fuzzer, and the exe's import and reproducibility checks.
 
 name: build
 
@@ -23,6 +24,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Toolchain
         run: rustup show active-toolchain
       - name: Device and CPUID tests
@@ -32,11 +35,43 @@ jobs:
         env:
           TEMPLEOS_FUZZ_ITERS: '2000000'
 
+  softcpu:
+    name: software CPU vs QEMU (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Cache the ISO
+        uses: actions/cache@v4
+        with:
+          path: payload/TempleOS.ISO
+          key: templeos-iso-${{ hashFiles('payload/TempleOS.ISO.pin') }}
+      - name: Fetch and verify the ISO
+        run: tools/fetch-payload.sh
+      - name: QEMU (Ubuntu 24.04 ships 8.2, the reference version)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86
+          qemu-system-x86_64 --version
+      - name: Software CPU tests (SeaBIOS, TempleOS boot)
+        run: cargo test --locked --release -p softcpu -p vmm -- --nocapture
+      - name: Same screens as QEMU for every script
+        run: tools/soft-vs-qemu.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soft-vs-qemu-${{ github.sha }}
+          path: soft-results/
+          if-no-files-found: ignore
+
   windows:
     name: TempleOS.exe
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Cache the ISO
         uses: actions/cache@v4
@@ -61,6 +96,7 @@ jobs:
         run: |
           $other = Join-Path $env:RUNNER_TEMP 'repro'
           git worktree add $other HEAD
+          git -C $other submodule update --init --depth 1
           Copy-Item payload/TempleOS.ISO (Join-Path $other 'payload')
           Push-Location $other
           ./tools/build-release.ps1 -OutDir dist -TargetDir (Join-Path $env:RUNNER_TEMP 'repro-target')
@@ -79,7 +115,7 @@ jobs:
   release:
     name: publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [devices, windows]
+    needs: [devices, softcpu, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

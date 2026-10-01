@@ -1,5 +1,5 @@
 [workspace]
-members = ["vmm", "devices"]
+members = ["vmm", "devices", "softcpu"]
 resolver = "2"
 
 [workspace.package]

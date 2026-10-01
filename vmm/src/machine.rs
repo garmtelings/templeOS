@@ -41,86 +41,17 @@ use windows::Win32::System::Hypervisor::*;
 
 use crate::bitop;
 use crate::cpuid::Cpuid;
+use crate::events::{BoardNews, Events};
 use crate::memory::{GuestMemory, MemRef, VGA_HOLE};
 use crate::timer::HrTimer;
 use crate::whpx::{self, Access, Partition};
 
 /// Most vCPUs a machine can have (TempleOS handles up to 128; WHPX 64).
-pub const MAX_CPUS: u32 = 64;
-
-pub struct Config {
-    pub ram_size: u64,
-    pub bios: &'static [u8],
-    pub vgabios: &'static [u8],
-    pub cdrom: Option<&'static [u8]>,
-    /// Hard disk on the primary IDE master.
-    pub hdd: Option<Box<dyn devices::ide::DiskImage>>,
-    /// Guest wall-clock time at power-on, in Unix seconds.
-    pub rtc_base: i64,
-    /// Map a VGA plane straight into the guest while that is exact
-    /// ([`devices::vga::Vga::fast_plane`]). Off means every access to the
-    /// VGA window is emulated.
-    pub vga_fast_path: bool,
-    /// Number of vCPUs, 1 to [`MAX_CPUS`].
-    pub cpus: u32,
-}
-
-/// Receives each rendered frame (see [`Machine::set_display`]).
-pub type DisplayFn = Box<dyn FnMut(&Frame)>;
-
-/// Told the PC speaker's tone whenever it changes (None = silent).
-pub type SpeakerFn = Box<dyn FnMut(Option<f64>)>;
-
-/// Wall time between rendered frames.
-const FRAME_NS: Nanos = 1_000_000_000 / 60;
+pub use crate::types::*;
 
 /// How often a halted vCPU looks at its local APIC for a pending IPI.
 const APIC_POLL: Duration = Duration::from_micros(250);
 
-/// Points in the boot the run loop recognizes and reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Milestone {
-    /// SeaBIOS printed its version banner on the debug console.
-    BiosBanner,
-    /// The vCPU is in long mode (EFER.LMA) for the first time.
-    LongMode,
-    /// The kernel programmed PIT channel 0 for its 1 kHz tick (TimersInit).
-    KernelTimers,
-    /// An application processor was started (SIPI) for the first time.
-    ApStarted,
-}
-
-impl Milestone {
-    pub fn describe(self) -> &'static str {
-        match self {
-            Milestone::BiosBanner => "SeaBIOS banner on the debug console",
-            Milestone::LongMode => "guest entered long mode",
-            Milestone::KernelTimers => "kernel programmed the PIT (TimersInit)",
-            Milestone::ApStarted => "an application processor was started",
-        }
-    }
-}
-
-/// Why [`Machine::run`] returned.
-#[derive(Debug)]
-pub enum Stop {
-    Milestone(Milestone),
-    TimeLimit,
-    ResetRequested,
-    /// The stop flag was set (e.g. the window was closed).
-    Quit,
-}
-
-#[derive(Debug)]
-pub struct Error(pub String);
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
 
 impl From<whpx::Error> for Error {
     fn from(e: whpx::Error) -> Self {
@@ -289,19 +220,13 @@ pub struct Machine {
     /// The BSP executed HLT and waits for an interrupt; the flag is RFLAGS.IF
     /// at the HLT.
     halted: Option<bool>,
-    reached: Vec<Milestone>,
-    /// Debug console output not yet split into lines.
-    debugcon_line: Vec<u8>,
-    debugcon_sink: Option<Box<dyn std::io::Write>>,
-    echo_debugcon: bool,
+    events: Events,
     renderer: Renderer,
     frame: Frame,
     next_frame: Nanos,
     display: Option<DisplayFn>,
     stop_flag: Option<Arc<AtomicBool>>,
     input: Option<Arc<InputQueue>>,
-    speaker: Option<SpeakerFn>,
-    speaker_hz: Option<f64>,
 }
 
 const BSP: u32 = 0;
@@ -363,18 +288,13 @@ impl Machine {
             ready_for_pic: false,
             window_registered: false,
             halted: None,
-            reached: Vec::new(),
-            debugcon_line: Vec::new(),
-            debugcon_sink: None,
-            echo_debugcon: true,
+            events: Events::new(start),
             renderer: Renderer::new(),
             frame: Frame::default(),
             next_frame: 0,
             display: None,
             stop_flag: None,
             input: None,
-            speaker: None,
-            speaker_hz: None,
         };
         m.reset_bsp()?;
         Ok(m)
@@ -382,8 +302,7 @@ impl Machine {
 
     /// Also copy the raw debug console (port 0x402) output to `w`.
     pub fn set_debugcon_sink(&mut self, w: Box<dyn std::io::Write>, echo: bool) {
-        self.debugcon_sink = Some(w);
-        self.echo_debugcon = echo;
+        self.events.set_debugcon_sink(w, echo);
     }
 
     /// Run `f` on the board (locked).
@@ -416,7 +335,7 @@ impl Machine {
 
     /// Call `f` whenever the PC speaker starts, stops or changes pitch.
     pub fn set_speaker(&mut self, f: SpeakerFn) {
-        self.speaker = Some(f);
+        self.events.speaker = Some(f);
     }
 
     /// Render the display as it is now.
@@ -431,7 +350,7 @@ impl Machine {
     }
 
     pub fn reached(&self) -> &[Milestone] {
-        &self.reached
+        &self.events.reached
     }
 
     pub fn cpus(&self) -> u32 {
@@ -555,7 +474,7 @@ impl Machine {
             // SAFETY: WHV_X64_VP_EXECUTION_STATE is a bitfield over a u16.
             let state = unsafe { exit.VpContext.ExecutionState.AsUINT16 };
             if state & (1 << 4) != 0 {
-                self.reach(Milestone::LongMode);
+                self.events.reach(Milestone::LongMode);
             }
 
             match exit.ExitReason {
@@ -572,62 +491,9 @@ impl Machine {
     }
 
     fn check_events(&mut self, until: Option<Milestone>) -> Option<Stop> {
-        let (hz, out, kernel_timer, reset) = {
-            let mut board = self.shared.board();
-            let pc = &mut board.pc;
-            (pc.speaker_hz(), pc.take_debugcon(), pc.kernel_timer_programmed(), pc.take_reset_request())
-        };
-        if hz != self.speaker_hz {
-            self.speaker_hz = hz;
-            if std::env::var_os("TEMPLEOS_DEBUG").is_some() {
-                eprintln!("[speaker {:9.3}s] {hz:?}", self.shared.start.elapsed().as_secs_f64());
-            }
-            if let Some(f) = &mut self.speaker {
-                f(hz);
-            }
-        }
-        if !out.is_empty() {
-            self.debugcon(&out);
-        }
-        if kernel_timer && self.reached.contains(&Milestone::LongMode) {
-            self.reach(Milestone::KernelTimers);
-        }
-        if self.shared.ap_started.load(Ordering::Acquire) {
-            self.reach(Milestone::ApStarted);
-        }
-        if reset {
-            return Some(Stop::ResetRequested);
-        }
-        until.filter(|m| self.reached.contains(m)).map(Stop::Milestone)
-    }
-
-    fn reach(&mut self, m: Milestone) {
-        if !self.reached.contains(&m) {
-            self.reached.push(m);
-            let t = self.shared.start.elapsed().as_secs_f64();
-            println!("[vmm {t:8.3}s] milestone: {}", m.describe());
-        }
-    }
-
-    fn debugcon(&mut self, bytes: &[u8]) {
-        if let Some(w) = &mut self.debugcon_sink {
-            let _ = w.write_all(bytes);
-            let _ = w.flush();
-        }
-        for &b in bytes {
-            if b != b'\n' {
-                self.debugcon_line.push(b);
-                continue;
-            }
-            let line = String::from_utf8_lossy(&self.debugcon_line).into_owned();
-            self.debugcon_line.clear();
-            if self.echo_debugcon {
-                println!("[debugcon] {line}");
-            }
-            if line.starts_with("SeaBIOS (version") {
-                self.reach(Milestone::BiosBanner);
-            }
-        }
+        let news = BoardNews::take(&mut self.shared.board().pc);
+        let ap_started = self.shared.ap_started.load(Ordering::Acquire);
+        self.events.handle(news, ap_started, until)
     }
 
     /// Before entering the guest: hand it a pending 8259 interrupt if the

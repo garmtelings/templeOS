@@ -1,5 +1,6 @@
 //! TempleOS.exe: boots the embedded, unmodified TempleOS V5.03 ISO in a
-//! purpose-built VMM on the Windows Hypervisor Platform (see PLAN.md).
+//! purpose-built VMM on the Windows Hypervisor Platform, or, where that
+//! can't be used, on a software CPU (Bochs's; see PLAN.md).
 //!
 //! By default it opens a window showing the VGA display. `--headless` runs
 //! without one: the machine reports boot milestones and the SeaBIOS debug
@@ -14,7 +15,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use vmm::{Config, Machine, Milestone, Stop};
+use vmm::{Config, Machine, Milestone, SoftMachine, Stop};
 
 static BIOS: &[u8] = include_bytes!("../payload/bios.bin");
 /// SHA-256 of each embedded file as pinned in payload/ (see build.rs).
@@ -58,6 +59,9 @@ fullscreen. All other keys go to TempleOS.
                       (implies --exact-vga)
   --screen            print the VGA text screen when stopping
   --quiet             don't echo the debug console
+  --software-cpu      run on the software CPU even if the Windows Hypervisor
+                      Platform is available (it is used without it)
+  --hypervisor        require the Windows Hypervisor Platform
 ";
 
 struct Args {
@@ -80,6 +84,16 @@ struct Args {
     trace: Option<String>,
     screen: bool,
     quiet: bool,
+    backend: Backend,
+}
+
+/// Which CPU runs the guest.
+#[derive(Clone, Copy, PartialEq)]
+enum Backend {
+    /// The hypervisor if it's available, else the software CPU.
+    Auto,
+    Hypervisor,
+    Software,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -103,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
         trace: None,
         screen: false,
         quiet: false,
+        backend: Backend::Auto,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -145,6 +160,8 @@ fn parse_args() -> Result<Args, String> {
             "--trace" => a.trace = Some(value()?),
             "--screen" => a.screen = true,
             "--quiet" => a.quiet = true,
+            "--software-cpu" => a.backend = Backend::Software,
+            "--hypervisor" => a.backend = Backend::Hypervisor,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option {other}")),
         }
@@ -226,7 +243,53 @@ fn verify_payload() -> Result<(), String> {
     Ok(())
 }
 
-fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
+/// The guest's machine: on the hypervisor or on the software CPU, which
+/// offer the same interface.
+enum Vm {
+    Hypervisor(Machine),
+    Software(SoftMachine),
+}
+
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        impl Vm {
+            $(fn $name(&mut self, $($arg: $ty),*) -> $ret {
+                match self {
+                    Vm::Hypervisor(m) => m.$name($($arg),*),
+                    Vm::Software(m) => m.$name($($arg),*),
+                }
+            })*
+        }
+    };
+}
+
+forward! {
+    set_debugcon_sink(w: Box<dyn std::io::Write>, echo: bool) -> ();
+    set_trace(w: Box<dyn std::io::Write + Send>) -> ();
+    set_display(f: vmm::types::DisplayFn) -> ();
+    set_input(q: Arc<devices::input::InputQueue>) -> ();
+    set_stop_flag(f: Arc<std::sync::atomic::AtomicBool>) -> ();
+    set_speaker(f: vmm::types::SpeakerFn) -> ();
+    run(until: Option<Milestone>, limit: Option<Duration>) -> Result<Stop, vmm::Error>;
+}
+
+impl Vm {
+    fn render(&mut self) -> &devices::vga_render::Frame {
+        match self {
+            Vm::Hypervisor(m) => m.render(),
+            Vm::Software(m) => m.render(),
+        }
+    }
+
+    fn with_pc<R>(&self, f: impl FnOnce(&mut devices::pc::Pc) -> R) -> R {
+        match self {
+            Vm::Hypervisor(m) => m.with_pc(f),
+            Vm::Software(m) => m.with_pc(f),
+        }
+    }
+}
+
+fn machine(args: &Args) -> Result<Vm, Box<dyn std::error::Error>> {
     // Read an --iso file once, however often the guest reboots.
     static ISO_FILE: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
     let cdrom: Option<&'static [u8]> = match (&args.iso, args.no_cd) {
@@ -251,7 +314,7 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let mut m = Machine::new(Config {
+    let cfg = Config {
         ram_size: args.mem_mib << 20,
         bios: BIOS,
         vgabios: VGABIOS,
@@ -266,7 +329,25 @@ fn machine(args: &Args) -> Result<Machine, Box<dyn std::error::Error>> {
                 std::thread::available_parallelism().map_or(1, |n| n.get() as u32).min(8)
             }
         }),
-    })?;
+        exact_time: false,
+    };
+    let software = match args.backend {
+        Backend::Software => true,
+        Backend::Hypervisor => false,
+        Backend::Auto => match vmm::whpx::check_available() {
+            Ok(()) => false,
+            Err(why) => {
+                // Said once per run, not on every guest reboot.
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    let why = why.lines().next().unwrap_or_default();
+                    println!("[vmm] {why} Using the software CPU (slower).");
+                });
+                true
+            }
+        },
+    };
+    let mut m = if software { Vm::Software(SoftMachine::new(cfg)?) } else { Vm::Hypervisor(Machine::new(cfg)?) };
     if let Some(path) = &args.debugcon {
         m.set_debugcon_sink(Box::new(File::create(path)?), !args.quiet);
     } else if args.quiet {

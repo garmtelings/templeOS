@@ -1,0 +1,4 @@
+[submodule "softcpu/bochs"]
+	path = softcpu/bochs
+	url = https://github.com/bochs-emu/Bochs
+	shallow = true

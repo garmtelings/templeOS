@@ -419,11 +419,58 @@ Not done:
 - [ ] Optional: an Authenticode signature (needs a certificate), an icon
   and version resource.
 
-### Phase 8 (optional) — No-hypervisor fallback
+### Phase 8 — No-hypervisor fallback (software CPU)
 - For machines without virtualization, embed a software x86-64 CPU. To keep
   it "byte-instruction perfect" this must be a proven core (e.g. the Bochs
   CPU, via FFI) and not a new one, and it must pass the same Phase 6 suite.
   It'll be slow but correct.
+
+Done:
+- [x] **Bochs 3.1's CPU core, unmodified**: `softcpu/bochs` is a submodule
+  pinned to the release commit (`REL_3_1_FINAL`, 30cfd566). `softcpu/`
+  builds only cpu/ (+ decoder, FPU, softfloat, CPU database),
+  `pc_system.cc` (timers) and `gui/paramtree.cc`, with our `config.h`
+  (Bochs's configure output, two marked edits) and glue
+  (`softcpu/glue/`): memory, port I/O, the 8259's INTR/IAC and CPUID go to
+  our board; Bochs's own local APIC is used. Bochs is told what a bochsrc
+  would say: unknown MSRs #GP, triple fault resets, 1 tick = 1 instruction.
+- [x] **qemu64 as a Bochs CPU model**, added from outside: our `cpudb.h`
+  lists it before Bochs's models. CPUID answers come from the same table as
+  the hypervisor's (vmm/src/cpuid.rs, checked against QEMU captures); the
+  instruction set enabled follows its feature bits. EDX after reset holds
+  the CPU signature, as QEMU's. Not emulated: SVM (advertised by qemu64,
+  used by neither SeaBIOS nor TempleOS).
+- [x] **`vmm::SoftMachine`**, same interface as the hypervisor machine, on
+  the same board, any OS. Processors take turns on one thread (Bochs's SMP
+  loop). Guest time = instruction count (QEMU `-icount shift=0`); with
+  `Config::exact_time` runs repeat exactly, otherwise the clock is kept
+  with the host's between 1 ms slices. Milestones, debug console, speaker,
+  input and display are shared with the hypervisor machine (vmm/src/events.rs).
+- [x] **SeaBIOS boots on it** (test `vmm/tests/soft_boot.rs`), on Linux:
+  the screen matches QEMU's except for one board gap (below).
+- [x] **TempleOS.exe falls back to it** when the Windows Hypervisor Platform
+  isn't available (`--software-cpu` forces it, `--hypervisor` forbids it).
+  The exe links it statically (no new DLLs; +2.7 MB).
+- [x] **CI** (Linux job "software CPU vs QEMU"): boots TempleOS from the CD
+  on the software CPU, and runs every `tests/scripts/*.script` on it and on
+  QEMU 8.2 (`tools/soft-vs-qemu.sh`, `vmm/examples/softrun.rs`), requiring
+  the same screens (with the scripts' masks).
+
+Found on the way (board, not CPU; affects the hypervisor build too):
+- [ ] **fw_cfg has 2 of QEMU's 12 files.** Missing: `bootorder`,
+  `bios-geometry`, `etc/acpi/tables`, `etc/table-loader`, `etc/acpi/rsdp`,
+  `etc/smbios/*`, `etc/system-states`, `etc/tpm/log`,
+  `genroms/kvmvapic.bin`. Visible: SeaBIOS doesn't move the ACPI PM base
+  to 0x600 (uses 0xB008, QEMU 0x608), and with no boot media at all tries
+  the floppy before the hard disk. Neither happens on a TempleOS boot (the
+  CD or the disk is always there), and the Phase 6 runs passed; but the
+  fw_cfg data goes by DMA, which the trace replays can't check.
+
+To do:
+- [ ] First green run of the CI comparison; then 2+ CPUs, and the hard
+  disk install (BootHDIns) on the software CPU.
+- [ ] Speed: measure; the VGA fast path (direct plane mapping) is not used
+  on the software CPU yet.
 
 ## Risks
 
@@ -438,6 +485,9 @@ Not done:
 ## Licensing
 
 - TempleOS: public domain, so it's fine to embed.
+- Bochs's CPU core (Phase 8): LGPL 2.1. Linked statically, so the release
+  ships its source (the pinned submodule) and our build (softcpu/), which is
+  what the LGPL asks for relinking.
 - SeaBIOS / SeaVGABIOS: LGPLv3. Ship the pinned source tarball URLs + build
   script in the repo, and let the blobs be replaced (they're loadable from
   a file override flag).
