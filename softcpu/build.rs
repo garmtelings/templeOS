@@ -19,6 +19,31 @@ fn sources(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// The few places where Bochs's behaviour differs from QEMU's in a way the
+/// guest can observe and nothing else can fix. Each is applied to a copy in
+/// OUT_DIR (the submodule stays untouched) and must match exactly.
+///
+/// PAUSE: QEMU's pause makes a processor yield to the others (it leaves
+/// the translation block and the round-robin loop moves on); Bochs's does
+/// nothing. Without the yield SeaBIOS's SMP start-up hangs: its BSP loops
+/// `movl $0, SMPLock; pause; lock bts SMPLock` and the APs never see the
+/// lock free. Here PAUSE ends the trace and tells softcpu_run to switch
+/// processors (glue/host.cc).
+const PATCHED: &[(&str, &str, &str)] = &[(
+    "proc_ctrl.cc",
+    "    if (SVM_INTERCEPT(SVM_INTERCEPT0_PAUSE)) SvmInterceptPAUSE();\n  }\n#endif\n\n  BX_NEXT_INSTR(i);",
+    "    if (SVM_INTERCEPT(SVM_INTERCEPT0_PAUSE)) SvmInterceptPAUSE();\n  }\n#endif\n\n  // TempleOS.exe: as QEMU's pause, yield to the other processors (softcpu_run).\n  if (BX_SMP_PROCESSORS > 1) {\n    extern bool softcpu_yield;\n    softcpu_yield = true;\n    BX_CPU_THIS_PTR async_event |= BX_ASYNC_EVENT_STOP_TRACE;\n  }\n\n  BX_NEXT_INSTR(i);",
+)];
+
+/// `src` with `old` replaced by `new`, written to OUT_DIR.
+fn patched(src: &Path, old: &str, new: &str) -> PathBuf {
+    let text = std::fs::read_to_string(src).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+    assert_eq!(text.matches(old).count(), 1, "{}: patch context not found exactly once", src.display());
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join(src.file_name().unwrap());
+    std::fs::write(&out, text.replace(old, new)).unwrap();
+    out
+}
+
 fn main() {
     // Paths relative to this crate (Cargo runs build scripts from it): Bochs
     // puts __FILE__ in messages, and relative paths keep the build folder
@@ -50,9 +75,12 @@ fn main() {
             // __FILE__ (in assert's wide strings) absolute whatever path it
             // is given; /d1trimfile cuts this folder off it.
             let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-            b.flag("/EHsc").flag("/Brepro").flag(format!("/d1trimfile:{dir}\\"));
+            let out = std::env::var("OUT_DIR").unwrap();
+            b.flag("/EHsc").flag("/Brepro").flag(format!("/d1trimfile:{dir}\\")).flag(format!("/d1trimfile:{out}\\"));
         } else {
-            b.flag("-w");
+            // The patched copies live in OUT_DIR; keep that path out of __FILE__.
+            let out = std::env::var("OUT_DIR").unwrap();
+            b.flag("-w").flag(format!("-ffile-prefix-map={out}=softcpu"));
         }
         // The C++ runtime is linked once, below.
         b.cpp_link_stdlib(None);
@@ -81,7 +109,10 @@ fn main() {
         .include(bochs.join("instrument/stubs"))
         .include(here.join("glue"));
     for d in ["", "decoder", "fpu", "cpudb/intel", "cpudb/amd"] {
-        b.files(sources(&cpu.join(d)));
+        b.files(sources(&cpu.join(d)).into_iter().filter(|f| !PATCHED.iter().any(|(name, ..)| f.ends_with(name))));
+    }
+    for (name, old, new) in PATCHED {
+        b.file(patched(&cpu.join(name), old, new));
     }
     b.file(bochs.join("pc_system.cc")).file(bochs.join("gui/paramtree.cc"));
     b.files(sources(&here.join("glue")));

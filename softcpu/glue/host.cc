@@ -500,9 +500,20 @@ extern "C" const char *softcpu_error(void)
   return error_text.c_str();
 }
 
-// As bx_begin_simulation in Bochs's main.cc: one processor runs until it is
-// asked to stop; several take turns a trace at a time, and the tick count
-// advances by the instructions each one ran.
+extern "C" int softcpu_all_idle(void);
+
+// Set by PAUSE (patched, see build.rs) on a machine with several processors.
+bool softcpu_yield;
+
+// Instructions a processor may run in one turn when it doesn't yield.
+static const Bit64u TURN = 1000;
+
+// As bx_begin_simulation in Bochs's main.cc, with one change: one processor
+// runs until it is asked to stop; several take turns, and the tick count
+// advances by the instructions each one ran. A turn lasts until the
+// processor executes PAUSE or HLT or has run TURN instructions, as in
+// QEMU's round-robin loop (Bochs's own loop switches after every trace,
+// which can starve a processor spinning on a lock, see build.rs).
 extern "C" int softcpu_run(uint64_t ticks)
 {
   if (!error_text.empty()) return -1;
@@ -520,7 +531,17 @@ extern "C" int softcpu_run(uint64_t ticks)
       run = false;
     }
     while (!bx_pc_system.kill_bochs_request) {
-      if (run) BX_CPU(processor)->cpu_run_trace();
+      if (run) {
+        BX_CPU_C *cpu = BX_CPU(processor);
+        Bit64u start = cpu->get_icount();
+        softcpu_yield = false;
+        for (;;) {
+          Bit64u before = cpu->get_icount();
+          cpu->cpu_run_trace();
+          Bit64u now = cpu->get_icount();
+          if (now == before || softcpu_yield || now - start >= TURN || bx_pc_system.kill_bochs_request) break;
+        }
+      }
       else run = true;
       Bit32u n = (Bit32u)(BX_CPU(processor)->get_icount() - BX_CPU(processor)->icount_last_sync);
       if (n == 0) n = sim->num(BXPN_SMP_QUANTUM)->get();  // the CPU was halted
@@ -529,6 +550,12 @@ extern "C" int softcpu_run(uint64_t ticks)
         processor = 0;
         BX_TICKN(executed / BX_SMP_PROCESSORS);
         executed %= BX_SMP_PROCESSORS;
+        // All halted: let time pass to the next timer at once, as a single
+        // processor's HLT does (handleWaitForEvent), instead of in quanta.
+        if (softcpu_all_idle() && !bx_pc_system.kill_bochs_request) {
+          Bit32u left = bx_pc_system.getNumCpuTicksLeftNextEvent();
+          if (left > 1) BX_TICKN(left - 1);
+        }
       }
       BX_CPU(processor)->icount_last_sync = BX_CPU(processor)->get_icount();
     }

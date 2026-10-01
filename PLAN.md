@@ -479,7 +479,17 @@ To do:
   `__FILE__` in the exe; `/d1trimfile` strips the folder (found with
   tools/pe_diff.py, which CI runs when two builds differ). CI run
   36838036455: the two builds match.
-- [ ] 2+ CPUs, and the hard disk install (BootHDIns), on the software CPU.
+- [x] **Several CPUs** (found on a real PC: the windowed exe uses the host's
+  cores and showed a black screen). Bochs switches processors after every
+  trace and its PAUSE does nothing, so SeaBIOS's SMP start-up spin lock
+  starved the APs. Now, as in QEMU's round-robin loop, a processor's turn
+  lasts until PAUSE (which yields: the one patched line of Bochs, applied
+  to a build copy, see softcpu/build.rs), HLT, or 1000 instructions; and
+  when all are halted time jumps to the next timer. SeaBIOS with 2 CPUs
+  matches QEMU `-smp 2` (bar the known fw_cfg gap); a 2-CPU TempleOS boot
+  test runs in CI. The exe uses one core on the software CPU unless
+  `--cpus` says otherwise: its cores all run on one host thread.
+- [ ] The hard disk install (BootHDIns) on the software CPU.
 - [ ] Speed: measure; the VGA fast path (direct plane mapping) is not used
   on the software CPU yet.
 

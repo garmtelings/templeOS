@@ -426,9 +426,9 @@ impl SoftMachine {
             }
             if debug && last_report.elapsed() >= Duration::from_secs(1) {
                 last_report = Instant::now();
-                eprintln!("[debug] guest {:.3}s rip={:#x} idle={}", now as f64 / 1e9, unsafe { softcpu_rip(0) }, unsafe {
-                    softcpu_all_idle()
-                });
+                // SAFETY: plain queries of the core.
+                let rips: Vec<String> = (0..self.cpus).map(|i| format!("{:#x}", unsafe { softcpu_rip(i) })).collect();
+                eprintln!("[debug] guest {:.3}s rip={} idle={}", now as f64 / 1e9, rips.join(","), unsafe { softcpu_all_idle() });
             }
             let mut slice = SLICE;
             if self.display.is_some() {

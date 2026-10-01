@@ -314,23 +314,6 @@ fn machine(args: &Args) -> Result<Vm, Box<dyn std::error::Error>> {
         }
         None => None,
     };
-    let cfg = Config {
-        ram_size: args.mem_mib << 20,
-        bios: BIOS,
-        vgabios: VGABIOS,
-        cdrom,
-        hdd,
-        rtc_base,
-        vga_fast_path: !args.exact_vga,
-        cpus: args.cpus.unwrap_or_else(|| {
-            if args.headless {
-                1
-            } else {
-                std::thread::available_parallelism().map_or(1, |n| n.get() as u32).min(8)
-            }
-        }),
-        exact_time: false,
-    };
     let software = match args.backend {
         Backend::Software => true,
         Backend::Hypervisor => false,
@@ -346,6 +329,25 @@ fn machine(args: &Args) -> Result<Vm, Box<dyn std::error::Error>> {
                 true
             }
         },
+    };
+    let cfg = Config {
+        ram_size: args.mem_mib << 20,
+        bios: BIOS,
+        vgabios: VGABIOS,
+        cdrom,
+        hdd,
+        rtc_base,
+        vga_fast_path: !args.exact_vga,
+        // The software CPU runs every core on one host thread, so more cores
+        // only make it slower; it uses one unless asked.
+        cpus: args.cpus.unwrap_or_else(|| {
+            if args.headless || software {
+                1
+            } else {
+                std::thread::available_parallelism().map_or(1, |n| n.get() as u32).min(8)
+            }
+        }),
+        exact_time: false,
     };
     let mut m = if software { Vm::Software(SoftMachine::new(cfg)?) } else { Vm::Hypervisor(Machine::new(cfg)?) };
     if let Some(path) = &args.debugcon {

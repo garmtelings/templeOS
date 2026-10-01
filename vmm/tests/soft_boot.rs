@@ -71,3 +71,24 @@ fn templeos_boots_from_cd() {
     assert!(colors.len() > 2, "a blank screen");
     eprintln!("guest at 60 s after {:.1}s", host.elapsed().as_secs_f64());
 }
+
+#[test]
+fn templeos_boots_on_two_cpus() {
+    let Some(iso) = payload("TempleOS.ISO") else {
+        eprintln!("skipping: payload/TempleOS.ISO not found (tools/fetch-payload.sh)");
+        return;
+    };
+    let mut m = SoftMachine::new(config(Some(iso), 2)).unwrap();
+    // TempleOS starts the second core during boot; by 30 s it shows the
+    // install prompt.
+    assert!(matches!(m.run_until(None, 30_000_000_000).unwrap(), Stop::TimeLimit));
+    for ms in [Milestone::LongMode, Milestone::KernelTimers, Milestone::ApStarted] {
+        assert!(m.reached().contains(&ms), "{ms:?} not reached: {:?}", m.reached());
+    }
+    let frame = m.render();
+    assert_eq!(frame.mode, devices::vga_render::FrameMode::Graphics);
+    let mut colors: Vec<u32> = frame.pixels.clone();
+    colors.sort_unstable();
+    colors.dedup();
+    assert!(colors.len() > 2, "a blank screen");
+}

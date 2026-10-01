@@ -6,7 +6,9 @@
 //!
 //!   cargo run -p vmm --release --example softrun -- \
 //!       [--iso PATH|none] [--cpus N] [--script FILE --shots DIR]
-//!       [--seconds S --shot FILE.ppm] [--trace FILE]
+//!       [--seconds S --shot FILE.ppm] [--trace FILE] [--realtime]
+//!
+//! --realtime keeps guest time with the host clock, as the exe does.
 
 use std::path::{Path, PathBuf};
 
@@ -45,12 +47,14 @@ fn main() {
     let mut iso = Some(root().join("payload/TempleOS.ISO"));
     let (mut cpus, mut script, mut shots, mut seconds, mut shot_file) = (1, None, PathBuf::from("shots"), None, None);
     let mut trace: Option<PathBuf> = None;
+    let mut realtime = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| panic!("{a} needs a value"));
         match a.as_str() {
             "--iso" => iso = Some(value()).filter(|v| v != "none").map(PathBuf::from),
             "--cpus" => cpus = value().parse().expect("--cpus"),
+            "--realtime" => realtime = true,
             "--script" => script = Some(PathBuf::from(value())),
             "--shots" => shots = PathBuf::from(value()),
             "--seconds" => seconds = Some(value().parse::<f64>().expect("--seconds")),
@@ -68,10 +72,12 @@ fn main() {
         rtc_base: 1_511_136_000, // qemu_trace.py: -rtc base=2017-11-20T00:00:00
         vga_fast_path: false,
         cpus,
-        exact_time: true,
+        exact_time: !realtime,
     })
     .unwrap_or_else(|e| panic!("{e}"));
-    m.set_debugcon_sink(Box::new(std::io::sink()), false);
+    if std::env::var_os("SOFTRUN_DEBUGCON").is_none() {
+        m.set_debugcon_sink(Box::new(std::io::sink()), false);
+    }
     if let Some(t) = &trace {
         let f = std::fs::File::create(t).unwrap_or_else(|e| panic!("{}: {e}", t.display()));
         m.set_trace(Box::new(std::io::BufWriter::new(f)));
