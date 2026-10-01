@@ -65,11 +65,14 @@ pub fn check_available() -> std::result::Result<(), String> {
         )
     };
     if r.is_err() || present == 0 {
-        return Err("The Windows Hypervisor Platform is installed but the hypervisor is not running.\n\n\
-                    - If you just turned the feature on, restart Windows.\n\
-                    - Otherwise turn on virtualization (Intel VT-x / AMD-V, often called SVM) in the \
-                    BIOS/UEFI settings, then check in an administrator PowerShell:\n    \
-                    bcdedit /set hypervisorlaunchtype auto"
+        // The DLLs ship with Windows even when the feature is off, so this
+        // can't tell "feature off" from "hypervisor told not to start".
+        return Err("The Windows hypervisor is not running, so TempleOS can't start.\n\n\
+                    Fix (once, in an administrator PowerShell), then restart Windows:\n    \
+                    Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform\n    \
+                    bcdedit /set hypervisorlaunchtype auto\n\n\
+                    If that doesn't help, turn on virtualization (Intel VT-x / AMD-V, often \
+                    called SVM) in the BIOS/UEFI settings."
             .into());
     }
     Ok(())

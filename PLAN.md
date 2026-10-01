@@ -394,9 +394,11 @@ Done:
   load-time import is part of Windows.
 - [x] **Starts without WHPX**: the WHPX DLLs are delay-loaded (build.rs,
   MSVC), and `whpx::check_available` probes for them before any WHv call.
-  Two messages: feature not installed (the PowerShell command), or
-  installed but the hypervisor isn't running (restart, VT-x/AMD-V in the
-  firmware, `bcdedit /set hypervisorlaunchtype auto`).
+  Two messages: DLLs missing (the PowerShell command), or the hypervisor
+  isn't running (enable the feature and `bcdedit /set hypervisorlaunchtype
+  auto`, restart; else VT-x/AMD-V in the firmware). The DLLs can be present
+  with the feature off, as seen on a real PC, so the second message can't
+  claim the feature is installed.
 - [x] **Reproducible**: toolchain pinned (`rust-toolchain.toml`),
   `Cargo.lock` with `--locked`, build paths remapped out of the binary,
   deterministic link (`/Brepro`, `/PDBALTPATH:%_PDB%`).
