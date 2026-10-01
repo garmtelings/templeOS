@@ -466,9 +466,19 @@ Found on the way (board, not CPU; affects the hypervisor build too):
   CD or the disk is always there), and the Phase 6 runs passed; but the
   fw_cfg data goes by DMA, which the trace replays can't check.
 
+- [x] **TempleOS boots on it and draws exactly what QEMU draws** (CI run
+  36835000350, commit b51271e): the CD boot reaches the kernel's timers
+  and the install prompt; every screenshot of `cd_smoke` (install prompt,
+  shell, `Dir`) and `demos` (ScrnMemory, Hanoi, Palette, end) is
+  identical to QEMU 8.2's, 7 of 7. Speed on a CI runner: 73 s of guest
+  time (boot, typing, Dir) in 52 s; the demos 113 s in 96 s.
+- [x] **MSVC builds Bochs** (first try), and the Windows tests pass.
+
 To do:
-- [ ] First green run of the CI comparison; then 2+ CPUs, and the hard
-  disk install (BootHDIns) on the software CPU.
+- [ ] The release exe is no longer reproducible with MSVC (it is with
+  MinGW: identical sections). CI now prints where the two builds differ
+  (tools/pe_diff.py).
+- [ ] 2+ CPUs, and the hard disk install (BootHDIns), on the software CPU.
 - [ ] Speed: measure; the VGA fast path (direct plane mapping) is not used
   on the software CPU yet.
 

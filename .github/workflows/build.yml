@@ -103,7 +103,10 @@ jobs:
           Pop-Location
           $a = (Get-FileHash dist/TempleOS.exe).Hash
           $b = (Get-FileHash (Join-Path $other 'dist/TempleOS.exe')).Hash
-          if ($a -ne $b) { Write-Error "not reproducible: $a vs $b"; exit 1 }
+          if ($a -ne $b) {
+            python tools/pe_diff.py dist/TempleOS.exe (Join-Path $other 'dist/TempleOS.exe')
+            Write-Error "not reproducible: $a vs $b"; exit 1
+          }
           Write-Host "reproducible: $a"
 
       - uses: actions/upload-artifact@v4
