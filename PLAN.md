@@ -475,9 +475,10 @@ Found on the way (board, not CPU; affects the hypervisor build too):
 - [x] **MSVC builds Bochs** (first try), and the Windows tests pass.
 
 To do:
-- [ ] The release exe is no longer reproducible with MSVC (it is with
-  MinGW: identical sections). CI now prints where the two builds differ
-  (tools/pe_diff.py).
+- [x] **Reproducible again with Bochs inside**: MSVC put assert's absolute
+  `__FILE__` in the exe; `/d1trimfile` strips the folder (found with
+  tools/pe_diff.py, which CI runs when two builds differ). CI run
+  36838036455: the two builds match.
 - [ ] 2+ CPUs, and the hard disk install (BootHDIns), on the software CPU.
 - [ ] Speed: measure; the VGA fast path (direct plane mapping) is not used
   on the software CPU yet.
