@@ -91,6 +91,12 @@ jobs:
         shell: pwsh
         run: tools/build-release.ps1 -OutDir dist
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TempleOS-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+
       - name: Reproducible (second build in another folder)
         shell: pwsh
         run: |
@@ -109,11 +115,6 @@ jobs:
           }
           Write-Host "reproducible: $a"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: TempleOS-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
 
   release:
     name: publish release

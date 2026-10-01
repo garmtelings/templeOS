@@ -46,8 +46,11 @@ fn main() {
             b.define("WIN32", None).define("_CRT_SECURE_NO_WARNINGS", None);
         }
         if msvc {
-            // /Brepro: no timestamps in the objects either.
-            b.flag("/EHsc").flag("/Brepro");
+            // /Brepro: no timestamps in the objects either. MSVC makes
+            // __FILE__ (in assert's wide strings) absolute whatever path it
+            // is given; /d1trimfile cuts this folder off it.
+            let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+            b.flag("/EHsc").flag("/Brepro").flag(format!("/d1trimfile:{dir}\\"));
         } else {
             b.flag("-w");
         }
